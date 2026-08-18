@@ -28,7 +28,7 @@ Vai sulla scheda Ricerca e clicca sul pulsante Plugin di ricerca... in basso a d
 Clicca su Installa un nuovo plugin e seleziona l'opzione Web link.  
 
 Incolla il link "Raw" ufficiale del file:
-[https://raw.githubusercontent.com/Gian10501/qbittorrent-torrentio-plugin/main/torrentio.py](https://raw.githubusercontent.com/Gian10501/qbittorrent-torrentio-plugin/main/torrentio.py)
+[https://raw.githubusercontent.com/gigio820373/qbittorrent-torrentio-plugin/main/torrentio.py](https://raw.githubusercontent.com/gigio820373/qbittorrent-torrentio-plugin/main/torrentio.py)
 
 Clicca su OK. Il plugin "Torrentio Ultra ITA" apparirà istantaneamente nella lista.  
 
