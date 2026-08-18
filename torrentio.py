@@ -1,5 +1,5 @@
 # VERSION: 2.00
-# AUTHORS: Gian10501
+# AUTHORS: gigio820373
 # LICENSING INFORMATION: GPL v3
 # DESCRIZIONE: Motore Torrentio Definitivo: Ricerca IMDb Nativa (Zero API esterne) + Multithreading Parallelo.
 
