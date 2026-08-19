@@ -1,7 +1,7 @@
-# VERSION: 2.00
+# VERSION: 2.10
 # AUTHORS: gigio820373
 # LICENSING INFORMATION: GPL v3
-# DESCRIZIONE: Motore Torrentio Definitivo: Ricerca IMDb Nativa (Zero API esterne) + Multithreading Parallelo.
+# DESCRIZIONE: Motore Torrentio Definitivo: Ricerca IMDb Nativa (Zero API) + Multithreading + Fix URL Parsing.
 
 import urllib.request
 import urllib.parse
@@ -22,11 +22,17 @@ class torrentio(object):
     }
 
     def __init__(self):
-        # Configurazioni Torrentio: P2P puro, provider gratuiti, filtro rigido in lingua.
-        self.torrentio_base = "https://torrentio.strem.fun/providers=yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,ilcorsaronero,magnetdl|language=italian,foreign"
+        # Configurazioni Torrentio: Il carattere pipe (|) DEVE essere codificato come %7C per evitare eccezioni urllib.error.InvalidURL su Python 3.12+
+        self.torrentio_base = "https://torrentio.strem.fun/providers=yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,ilcorsaronero,magnetdl%7Clanguage=italian"
+
+    def _get_headers(self):
+        return {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
+        }
 
     def _extract_season_episode(self, query):
-        """Estrae con precisione chirurgica le direttive di Stagione ed Episodio."""
         match = re.search(r'\b(?:s|season\s*)(\d{1,2})\s*(?:e|episode\s*|\times\s*)(\d{1,2})\b', query, re.IGNORECASE)
         if match: 
             return int(match.group(1)), int(match.group(2))
@@ -38,11 +44,6 @@ class torrentio(object):
         return None, None
 
     def _search_imdb_direct(self, query, cat):
-        """
-        Sfrutta l'API di autocompletamento pubblica di IMDb aggirando la necessità
-        di qualsiasi API Key o servizio ponte.
-        """
-        # Creazione di uno "slug" stringa compatibile con l'infrastruttura AWS/WAF di IMDb
         slug = re.sub(r'[^a-z0-9_]', '', query.lower().replace(' ', '_'))
         if not slug: 
             return []
@@ -51,8 +52,8 @@ class torrentio(object):
         imdb_url = f"https://v3.sg.media-imdb.com/suggestion/{first_char}/{slug}.json"
         
         try:
-            req = urllib.request.Request(imdb_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-            with urllib.request.urlopen(req, timeout=5) as response:
+            req = urllib.request.Request(imdb_url, headers=self._get_headers())
+            with urllib.request.urlopen(req, timeout=8) as response:
                 data = json.loads(response.read().decode('utf-8'))
         except Exception:
             return []
@@ -65,7 +66,6 @@ class torrentio(object):
                 
             item_type = item.get('qid', '')
             
-            # Applicazione logica del filtro categorie di qBittorrent
             if cat == 'movies' and item_type not in ('movie', 'tvMovie'):
                 continue
             if cat == 'tv' and item_type not in ('tvSeries', 'tvMiniSeries'):
@@ -80,10 +80,9 @@ class torrentio(object):
                 'type': content_type
             })
             
-        return results[:4] # Trattiene solo i 4 candidati più probabili
+        return results[:4]
 
     def _fetch_stream(self, stream_req):
-        """Funzione worker atomica per il multithreading."""
         imdb_id, season, episode, content_type, title, year = stream_req
         
         if content_type == 'series' and season is not None and episode is not None:
@@ -94,9 +93,10 @@ class torrentio(object):
         req_url = f"{self.torrentio_base}/stream/{content_type}/{stream_id}.json"
         
         try:
-            req = urllib.request.Request(req_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-            with urllib.request.urlopen(req, timeout=8) as response:
-                return json.loads(response.read().decode('utf-8')).get('streams', []), title, year, imdb_id, season, episode
+            req = urllib.request.Request(req_url, headers=self._get_headers())
+            with urllib.request.urlopen(req, timeout=10) as response:
+                resp_data = json.loads(response.read().decode('utf-8'))
+                return resp_data.get('streams', []), title, year, imdb_id, season, episode
         except Exception:
             return [], title, year, imdb_id, season, episode
 
@@ -107,22 +107,18 @@ class torrentio(object):
         
         season, episode = self._extract_season_episode(raw_query)
         
-        # Sterilizza la query asportando parametri di episodi prima di inviarla a IMDb
         clean_query = re.sub(r'\b(?:s|season\s*)\d{1,2}\s*(?:e|episode\s*|\times\s*)\d{1,2}\b', '', raw_query, flags=re.IGNORECASE)
         clean_query = re.sub(r'\b\d{1,2}x\d{1,2}\b', '', clean_query, flags=re.IGNORECASE).strip()
 
-        # Step 1: Risoluzione IMDb pura
         imdb_results = self._search_imdb_direct(clean_query, cat)
         if not imdb_results: 
             return
 
-        # Costruzione del pool di richieste
         stream_requests = []
         for item in imdb_results:
             c_type = 'series' if season is not None else item['type']
             stream_requests.append((item['id'], season, episode, c_type, item['title'], item['year']))
             
-        # Step 2: Aggregazione Torrentio in Multithreading Parallelo
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(self._fetch_stream, req) for req in stream_requests]
             
@@ -140,13 +136,11 @@ class torrentio(object):
                     else:
                         display_name = f"[Torrentio] {title}{year_str} - {first_line} [{provider}]"
                         
-                    # Motore RegEx per l'isolamento dei Seeds
                     seeds = '-1'
                     seeds_match = re.search(r'👤\s*(\d+)', raw_title)
                     if seeds_match: 
                         seeds = seeds_match.group(1)
                         
-                    # Conversione Byte Automatica
                     size_bytes = '-1'
                     size_match = re.search(r'💾\s*([\d\.]+)\s*([GMK]?B|GiB|MiB|KiB)', raw_title, re.IGNORECASE)
                     if size_match:
