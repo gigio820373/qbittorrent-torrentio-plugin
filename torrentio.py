@@ -1,11 +1,13 @@
-# VERSION: 2.70
+# VERSION: 3.00
 # AUTHORS: gigio820373
 # LICENSING INFORMATION: GPL v3
 # DESCRIZIONE: Torrentio Ultra ITA: ricerca IMDb nativa (zero API) + multithreading
 #              + season pack + filtri query + rate limit adattivo + fallback Cloudflare
 #              + caching + timeout globale + SELF-HEALING (istanze multiple con blacklist)
 #              + sort=qualitysize + qualityfilter esteso + proxy multipli con rotazione
-#              + estrazione codec/audio + deduplica intelligente + refactoring.
+#              + estrazione codec/audio + deduplica intelligente + refactoring
+#              + CIRCUIT BREAKER su IMDb + TORRENTIO CLIENT separato
+#              + ParsedStream tipizzato + CHECK VERSIONE PYTHON all'avvio.
 
 import concurrent.futures
 import datetime
@@ -13,6 +15,7 @@ import json
 import os
 import random
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +23,15 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
+
+# --- Punto 6: controllo esplicito della versione Python -----------------
+if sys.version_info < (3, 8):
+    raise RuntimeError(
+        "Torrentio Ultra ITA richiede Python 3.8 o superiore "
+        "(rilevato {}.{}). Aggiorna Python o usa una build di qBittorrent "
+        "con Python piu' recente.".format(*sys.version_info[:2])
+    )
 
 from novaprinter import prettyPrinter
 
@@ -37,6 +49,11 @@ class _RateLimiter(object):
         self._current = interval
         self._lock = threading.Lock()
         self._last = 0.0
+
+    @property
+    def current(self):
+        with self._lock:
+            return self._current
 
     def wait(self):
         with self._lock:
@@ -133,6 +150,184 @@ class _InstanceHealth(object):
             return {u: dict(s) for u, s in self._state.items()}
 
 
+class _CircuitBreaker(object):
+    """Circuit breaker a tre stati per proteggere endpoint instabili.
+
+    CLOSED    -> le richieste passano normalmente.
+    OPEN      -> le richieste falliscono subito senza toccare la rete.
+    HALF_OPEN -> viene concessa una singola richiesta di prova; in base
+                 all'esito si torna CLOSED o si riapre OPEN.
+    """
+
+    CLOSED = 'closed'
+    OPEN = 'open'
+    HALF_OPEN = 'half_open'
+
+    def __init__(self, fail_threshold=5, recovery_timeout=60.0):
+        self.fail_threshold = fail_threshold
+        self.recovery_timeout = recovery_timeout
+        self._state = self.CLOSED
+        self._failures = 0
+        self._opened_at = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def state(self):
+        with self._lock:
+            return self._state
+
+    def allow_request(self):
+        with self._lock:
+            now = time.monotonic()
+            if self._state == self.OPEN:
+                if now - self._opened_at >= self.recovery_timeout:
+                    self._state = self.HALF_OPEN
+                    return True
+                return False
+            return True
+
+    def record_success(self):
+        with self._lock:
+            self._failures = 0
+            self._state = self.CLOSED
+
+    def record_failure(self):
+        with self._lock:
+            self._failures += 1
+            if self._state == self.HALF_OPEN:
+                self._state = self.OPEN
+                self._opened_at = time.monotonic()
+            elif self._failures >= self.fail_threshold:
+                self._state = self.OPEN
+                self._opened_at = time.monotonic()
+
+
+# --- Punto 4: contratto esplicito per i metadati estratti da Torrentio
+@dataclass(frozen=True)
+class ParsedStream:
+    """Risultato del parsing di uno stream restituito da Torrentio.
+
+    Ogni campo e' tipizzato ed esplicito: se aggiungi una nuova metrica
+    (es. HDR) devi aggiungerla qui, e il type checker ti dice subito
+    dove va consumata.
+    """
+    first_line: str
+    quality: str
+    tracker: str
+    is_ita: bool
+    is_sub: bool
+    is_pack: bool
+    codec: str
+    size_bytes: str
+    seeds: str
+
+
+# --- Punto 3: client HTTP Torrentio separato dall'orchestratore
+class _TorrentioClient(object):
+    """Incapsula tutta la logica di rete verso Torrentio.
+
+    Responsabilita':
+      - provare le istanze in ordine di salute;
+      - su 403 tentare i proxy configurati;
+      - su errori transitori tentare un URL "pulito" (senza filtri);
+      - aggiornare l'health tracker.
+
+    Non conosce il rate limiter, la cache, o il parsing: quelle sono
+    responsabilita' dell'orchestratore (`torrentio`). Questo permette di
+    testare il client in isolamento iniettando un finto `http_json`.
+    """
+
+    def __init__(self, http_json, base_url_builder, logger,
+                 health_tracker=None, proxy_urls=None,
+                 use_proxy_on_block=True, proxy_timeout=8,
+                 fallback_on_block=True):
+        self._http_json = http_json
+        self._base_url_builder = base_url_builder
+        self._logger = logger or (lambda msg: None)
+        self._health = health_tracker
+        self._proxy_urls = list(proxy_urls or [])
+        self._use_proxy_on_block = use_proxy_on_block
+        self._proxy_timeout = proxy_timeout
+        self._fallback_on_block = fallback_on_block
+
+    def fetch_stream(self, instances, path):
+        """Ritorna (streams, error). error=None indica successo."""
+        ordered = (
+            self._health.get_ordered_instances(instances)
+            if self._health is not None else list(instances)
+        )
+        last_error = 'all_failed'
+        for base in ordered:
+            streams, error = self._try_instance(base, path)
+            if error is None:
+                if self._health is not None:
+                    self._health.record_success(base)
+                return streams, None
+            if self._health is not None:
+                self._health.record_failure(base, error)
+            last_error = error
+            self._logger('istanza {} in errore ({}), passo alla successiva'.format(base, error))
+        self._logger('tutte le istanze Torrentio hanno fallito per {}'.format(path))
+        return [], last_error
+
+    def _apply_proxy(self, url, template):
+        if not template:
+            return url
+        if '{rawUrl}' in template:
+            return template.replace('{rawUrl}', url)
+        if '{url}' in template:
+            return template.replace('{url}', urllib.parse.quote(url, safe=''))
+        return template.rstrip('/') + '/' + urllib.parse.quote(url, safe='')
+
+    def _try_proxies(self, target_url):
+        if not self._proxy_urls or not self._use_proxy_on_block:
+            return None, 'blocked'
+        for template in self._proxy_urls:
+            proxy_url = self._apply_proxy(target_url, template)
+            self._logger('provo proxy: {}'.format(proxy_url))
+            data, error = self._http_json(
+                proxy_url, timeout=self._proxy_timeout, retries=0, throttle=False
+            )
+            if error is None:
+                streams = data.get('streams') if isinstance(data, dict) else None
+                if isinstance(streams, list):
+                    self._logger('proxy {} riuscito'.format(template.split('{')[0]))
+                    return streams, None
+            self._logger('proxy fallito ({}): passo al successivo'.format(error))
+        return None, 'blocked'
+
+    def _try_instance(self, base, path):
+        url = '{}/stream/{}.json'.format(self._base_url_builder(base), path)
+        data, error = self._http_json(url, throttle=True)
+        if error is None:
+            streams = data.get('streams') if isinstance(data, dict) else None
+            return (streams if isinstance(streams, list) else []), None
+
+        if error == 'blocked':
+            streams, proxy_error = self._try_proxies(url)
+            if proxy_error is None:
+                return streams, None
+            return None, 'blocked'
+
+        if error == 'ratelimit':
+            return None, error
+
+        if self._fallback_on_block:
+            fallback_url = '{}/stream/{}.json'.format(base.rstrip('/'), path)
+            self._logger('fallback URL pulito su {} per {}'.format(base, path))
+            data2, error2 = self._http_json(fallback_url, throttle=True)
+            if error2 is None:
+                streams = data2.get('streams') if isinstance(data2, dict) else None
+                return (streams if isinstance(streams, list) else []), None
+            if error2 == 'blocked':
+                streams, proxy_error = self._try_proxies(fallback_url)
+                if proxy_error is None:
+                    return streams, None
+            return None, error2
+
+        return None, error
+
+
 class torrentio(object):
     url = 'https://torrentio.strem.fun'
     name = 'Torrentio Ultra ITA'
@@ -152,7 +347,6 @@ class torrentio(object):
     ONLY_ITA = False
     USE_ITA_FLAG = True
 
-    # Istanze Torrentio: la prima e' la preferita, le altre sono fallback.
     TORRENTIO_INSTANCES = [
         'https://torrentio.strem.fun',
         'https://torrentio.elfhosted.com',
@@ -163,12 +357,8 @@ class torrentio(object):
         "torrentgalaxy,ilcorsaronero,magnetdl,nyaasi"
     )
 
-    # Filtro qualita' esteso: esclude anche 480p, unknown e "other" oltre a scr/cam.
     QUALITY_FILTER = '480p,other,scr,cam,unknown'
-
-    # Ordinamento lato Torrentio: 'qualitysize' migliora la qualita' percepita.
     TORRENTIO_SORT = 'qualitysize'
-
     LIMIT = ''
 
     USE_KITSU_FOR_ANIME = False
@@ -179,23 +369,15 @@ class torrentio(object):
     HTTP_TIMEOUT = 10
     HTTP_RETRIES = 2
 
-    # --- Rate limiting ---
     RATE_LIMIT_ENABLED = True
     RATE_LIMIT_INTERVAL = 1.0
     RATE_LIMIT_ADAPTIVE = True
 
-    # --- Self-healing ---
     SELF_HEALING_ENABLED = True
     HEALTH_FAIL_THRESHOLD = 2
     HEALTH_COOLDOWN = 120
     FALLBACK_ON_BLOCK = True
 
-    # --- Proxy per Cloudflare (opzionale) ---
-    # Lista di proxy pubblici gratuiti. Vengono provati in ordine quando un'istanza
-    # risponde 403 (blocco Cloudflare). Se un proxy fallisce, si passa al successivo.
-    # Formati supportati:
-    #   {url}    -> URL codificato con urllib.parse.quote
-    #   {rawUrl} -> URL non codificato (per proxy che lo richiedono)
     PROXY_URLS = [
         'https://api.allorigins.win/raw?url={url}',
         'https://api.codetabs.com/v1/proxy?quest={url}',
@@ -205,19 +387,19 @@ class torrentio(object):
         'https://corsproxy.io/?url={url}',
     ]
     USE_PROXY_ON_BLOCK = True
-    PROXY_TIMEOUT = 8  # timeout dedicato ai proxy (più breve dell'HTTP_TIMEOUT)
+    PROXY_TIMEOUT = 8
 
-    # --- Caching ---
     CACHE_ENABLED = True
     CACHE_TTL_IMDB = 3600
     CACHE_TTL_STREAM = 300
 
-    # --- Ordinamento locale e timeout ---
     SORT_BY_SEEDS = True
     GLOBAL_TIMEOUT = 90
-
-    # --- Deduplica ---
     SMART_DEDUP = True
+
+    # --- Punto 2: circuit breaker per IMDb ---
+    IMDB_CB_FAIL_THRESHOLD = 5
+    IMDB_CB_RECOVERY_TIMEOUT = 60.0
 
     USER_AGENTS = [
         ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -295,12 +477,14 @@ class torrentio(object):
     _rate_limiter_shared = None
     _imdb_cache = None
     _stream_cache = None
+    _imdb_circuit_breaker = None
 
     def __init__(self):
         if not self.TORRENTIO_INSTANCES:
             raise ValueError('TORRENTIO_INSTANCES non puo\' essere vuota')
         self._health_tracker = self._get_or_create_health() if self.SELF_HEALING_ENABLED else None
         self._rate_limiter = self._get_or_create_rate_limiter() if self.RATE_LIMIT_ENABLED else None
+        self._imdb_cb = self._get_or_create_imdb_circuit_breaker()
         self._init_caches()
 
     # ------------------------------------------------------------------
@@ -323,6 +507,16 @@ class torrentio(object):
             if cls._rate_limiter_shared is None:
                 cls._rate_limiter_shared = _RateLimiter(cls.RATE_LIMIT_INTERVAL)
             return cls._rate_limiter_shared
+
+    @classmethod
+    def _get_or_create_imdb_circuit_breaker(cls):
+        with cls._shared_lock:
+            if cls._imdb_circuit_breaker is None:
+                cls._imdb_circuit_breaker = _CircuitBreaker(
+                    fail_threshold=cls.IMDB_CB_FAIL_THRESHOLD,
+                    recovery_timeout=cls.IMDB_CB_RECOVERY_TIMEOUT
+                )
+            return cls._imdb_circuit_breaker
 
     @classmethod
     def _init_caches(cls):
@@ -348,18 +542,6 @@ class torrentio(object):
         if self.LIMIT:
             options.append('limit=' + str(self.LIMIT))
         return base.rstrip('/') + '/' + '%7C'.join(options)
-
-    def _apply_proxy(self, url, template):
-        """Applica un template di proxy all'URL target.
-        Supporta {url} (encodato) e {rawUrl} (non encodato)."""
-        if not template:
-            return url
-        if '{rawUrl}' in template:
-            return template.replace('{rawUrl}', url)
-        if '{url}' in template:
-            return template.replace('{url}', urllib.parse.quote(url, safe=''))
-        # Fallback: prefisso semplice
-        return template.rstrip('/') + '/' + urllib.parse.quote(url, safe='')
 
     def _get_headers(self):
         return {
@@ -513,11 +695,22 @@ class torrentio(object):
                     items.append(self._make_item(imdb_id, imdb_id, '', kind == 'series', kind, link))
             return items
 
+        # --- Punto 2: circuit breaker prima di toccare la rete ---
+        if not self._imdb_cb.allow_request():
+            self._log('circuit breaker IMDb aperto: salto la ricerca')
+            return []
+
         slug = self._normalize_slug(query)
         if not slug:
             return []
         imdb_url = 'https://v3.sg.media-imdb.com/suggestion/{}/{}.json'.format(slug[0], slug)
-        data, _ = self._http_json(imdb_url, timeout=8, retries=1)
+        data, error = self._http_json(imdb_url, timeout=8, retries=1)
+
+        if error in ('server', 'timeout', 'network', 'ratelimit'):
+            self._imdb_cb.record_failure()
+        elif error is None:
+            self._imdb_cb.record_success()
+
         if not isinstance(data, dict):
             return []
 
@@ -644,67 +837,20 @@ class torrentio(object):
             'season_only': season_only
         }
 
-    def _try_proxies(self, target_url):
-        """Prova tutti i proxy configurati fino a trovarne uno funzionante.
-        Ritorna (streams, error) dove error=None significa successo."""
-        if not self.PROXY_URLS or not self.USE_PROXY_ON_BLOCK:
-            return None, 'blocked'
-
-        for template in self.PROXY_URLS:
-            proxy_url = self._apply_proxy(target_url, template)
-            self._log('provo proxy: {}'.format(proxy_url))
-            data, error = self._http_json(
-                proxy_url,
-                timeout=self.PROXY_TIMEOUT,
-                retries=0,  # niente retry sui proxy: se fallisce, passiamo al successivo
-                throttle=False
-            )
-            if error is None:
-                streams = data.get('streams') if isinstance(data, dict) else None
-                if isinstance(streams, list):
-                    self._log('proxy {} riuscito'.format(template.split('{')[0]))
-                    return streams, None
-            self._log('proxy fallito ({}): passo al successivo'.format(error))
-        return None, 'blocked'
-
-    def _try_instance(self, base, path):
-        """Prova una singola istanza con fallback URL pulito e proxy multipli.
-        Ritorna (streams, error) dove error=None significa successo."""
-        base_with_filters = self._build_base_url(base)
-        url = '{}/stream/{}.json'.format(base_with_filters, path)
-        data, error = self._http_json(url, throttle=True)
-        if error is None:
-            streams = data.get('streams') if isinstance(data, dict) else None
-            return (streams if isinstance(streams, list) else []), None
-
-        # Su 403, prova tutti i proxy in sequenza
-        if error == 'blocked':
-            streams, proxy_error = self._try_proxies(url)
-            if proxy_error is None:
-                return streams, None
-            self._log('tutti i proxy hanno fallito per {}'.format(base))
-            return None, 'blocked'
-
-        # 429: passa oltre (il rate limiter adattivo gestirà l'attesa)
-        if error == 'ratelimit':
-            return None, error
-
-        # Timeout/network/server: prova URL pulito sulla stessa istanza
-        if self.FALLBACK_ON_BLOCK:
-            fallback_url = '{}/stream/{}.json'.format(base.rstrip('/'), path)
-            self._log('fallback URL pulito su {} per {}'.format(base, path))
-            data2, error2 = self._http_json(fallback_url, throttle=True)
-            if error2 is None:
-                streams = data2.get('streams') if isinstance(data2, dict) else None
-                return (streams if isinstance(streams, list) else []), None
-            # Anche il fallback fallisce: prova i proxy anche sull'URL pulito
-            if error2 == 'blocked':
-                streams, proxy_error = self._try_proxies(fallback_url)
-                if proxy_error is None:
-                    return streams, None
-            return None, error2
-
-        return None, error
+    def _get_torrentio_client(self):
+        """Costruisce un client Torrentio con le dipendenze correnti.
+        Leggero: e' intenzionalmente ricreato a ogni ricerca per riflettere
+        eventuali modifiche runtime delle costanti di classe."""
+        return _TorrentioClient(
+            http_json=self._http_json,
+            base_url_builder=self._build_base_url,
+            logger=self._log,
+            health_tracker=self._health_tracker,
+            proxy_urls=self.PROXY_URLS,
+            use_proxy_on_block=self.USE_PROXY_ON_BLOCK,
+            proxy_timeout=self.PROXY_TIMEOUT,
+            fallback_on_block=self.FALLBACK_ON_BLOCK,
+        )
 
     def _fetch_stream(self, req):
         path = req['path']
@@ -715,33 +861,19 @@ class torrentio(object):
                 self._log('cache hit stream: {}'.format(path))
                 return req, list(cached)
 
-        if self._health_tracker is not None:
-            instances = self._health_tracker.get_ordered_instances(self.TORRENTIO_INSTANCES)
-        else:
-            instances = list(self.TORRENTIO_INSTANCES)
+        client = self._get_torrentio_client()
+        streams, error = client.fetch_stream(self.TORRENTIO_INSTANCES, path)
 
-        for base in instances:
-            streams, error = self._try_instance(base, path)
+        if error is None:
+            if self._rate_limiter is not None and self.RATE_LIMIT_ADAPTIVE:
+                self._rate_limiter.relax()
+            if self.CACHE_ENABLED and self._stream_cache is not None and streams:
+                self._stream_cache.set(path, list(streams))
+        elif error == 'ratelimit' and self._rate_limiter is not None and self.RATE_LIMIT_ADAPTIVE:
+            self._rate_limiter.escalate()
+            self._log('rate limit: aumento intervallo a {:.2f}s'.format(self._rate_limiter.current))
 
-            if error is None:
-                if self._health_tracker is not None:
-                    self._health_tracker.record_success(base)
-                if self._rate_limiter is not None and self.RATE_LIMIT_ADAPTIVE:
-                    self._rate_limiter.relax()
-                if self.CACHE_ENABLED and self._stream_cache is not None and streams:
-                    self._stream_cache.set(path, list(streams))
-                return req, streams
-
-            if self._health_tracker is not None:
-                self._health_tracker.record_failure(base, error)
-            if error == 'ratelimit' and self._rate_limiter is not None and self.RATE_LIMIT_ADAPTIVE:
-                self._rate_limiter.escalate()
-                self._log('rate limit: aumento intervallo a {:.2f}s'.format(self._rate_limiter._current))
-
-            self._log('istanza {} in errore ({}), passo alla successiva'.format(base, error))
-
-        self._log('tutte le istanze Torrentio hanno fallito per {}'.format(path))
-        return req, []
+        return req, streams
 
     # ------------------------------------------------------------------
     # Costruzione magnet
@@ -824,6 +956,7 @@ class torrentio(object):
         return '|'.join(tags)
 
     def _extract_metadata(self, stream, req, filters):
+        """Restituisce un ParsedStream oppure None se lo stream va scartato."""
         item = req['item']
         raw_title = str(stream.get('title') or '')
         lines = [line.strip() for line in raw_title.split('\n') if line.strip()]
@@ -852,42 +985,42 @@ class torrentio(object):
         if (filters['pack'] or req['season_only']) and not is_pack:
             return None
 
-        return {
-            'first_line': first_line,
-            'quality': quality,
-            'tracker': tracker,
-            'is_ita': is_ita,
-            'is_sub': is_sub,
-            'is_pack': is_pack,
-            'codec': self._extract_codec(first_line),
-            'size': self._parse_size(raw_title),
-            'seeds': self._parse_seeds(raw_title),
-        }
+        return ParsedStream(
+            first_line=first_line,
+            quality=quality,
+            tracker=tracker,
+            is_ita=is_ita,
+            is_sub=is_sub,
+            is_pack=is_pack,
+            codec=self._extract_codec(first_line),
+            size_bytes=self._parse_size(raw_title),
+            seeds=self._parse_seeds(raw_title),
+        )
 
     def _format_display_name(self, meta, req):
         item = req['item']
-        lang_tag = '[ITA] ' if meta['is_ita'] else ('[SUB ITA] ' if meta['is_sub'] else '')
-        qual_tag = '[{}] '.format(meta['quality']) if meta['quality'] and meta['quality'].lower() != 'torrentio' else ''
-        pack_tag = '[PACK] ' if meta['is_pack'] else ''
-        codec_tag = '[{}] '.format(meta['codec']) if meta['codec'] else ''
+        lang_tag = '[ITA] ' if meta.is_ita else ('[SUB ITA] ' if meta.is_sub else '')
+        qual_tag = '[{}] '.format(meta.quality) if meta.quality and meta.quality.lower() != 'torrentio' else ''
+        pack_tag = '[PACK] ' if meta.is_pack else ''
+        codec_tag = '[{}] '.format(meta.codec) if meta.codec else ''
         year_str = ' ({})'.format(item['year']) if item['year'] else ''
         return '{}{}{}{}{}{}{} - {} [{}]'.format(
             lang_tag, qual_tag, pack_tag, codec_tag,
-            item['title'], req['label'], year_str, meta['first_line'], meta['tracker']
+            item['title'], req['label'], year_str, meta.first_line, meta.tracker
         ).replace('|', ' ')
 
     def _stream_to_result(self, stream, req, filters):
         meta = self._extract_metadata(stream, req, filters)
         if not meta:
             return None
-        link = self._build_magnet(stream, meta['first_line'].replace('|', ' '))
+        link = self._build_magnet(stream, meta.first_line.replace('|', ' '))
         if not link:
             return None
         return {
             'link': link,
             'name': self._format_display_name(meta, req),
-            'size': meta['size'],
-            'seeds': meta['seeds'],
+            'size': meta.size_bytes,
+            'seeds': meta.seeds,
             'leech': '-1',
             'engine_url': self.url,
             'desc_link': req['item']['desc_link'],
