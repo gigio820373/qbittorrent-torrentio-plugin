@@ -46,7 +46,6 @@ Aggiornamento di solidificazione: nessuna nuova funzionalità visibile, ma il pl
 - 🔌 **Circuit Breaker su IMDb**: se l'endpoint IMDb fallisce 5 volte consecutive (server down, timeout, network), il plugin apre il circuito per 60 secondi. Le ricerche successive tornano vuote **istantaneamente**, senza far attendere l'utente per timeout+retry in cascata. Dopo i 60 secondi, una richiesta di prova verifica se il servizio è tornato disponibile.
 - 🧱 **Client Torrentio separato**: la logica di rete (istanze multiple, proxy, fallback) è stata estratta in una classe dedicata `_TorrentioClient`. Comportamento identico alla v2.70, ma il codice è ora testabile in isolamento.
 - 📦 **ParsedStream tipizzato**: i metadati estratti da uno stream non sono più un dizionario con chiavi arbitrarie, ma una dataclass con campi espliciti. Se in futuro aggiungi una metrica (es. HDR), il type checker ti segnala tutti i punti da aggiornare.
-- 🧪 **Suite di test completa**: nuova cartella `tests/` con 6 file e ~40 casi che coprono parsing, deduplica, magnet, display, circuit breaker e pipeline end-to-end con rete mockata. Tutti i test girano in pochi secondi senza mai toccare la rete.
 - 📚 **Documentazione architetturale**: nuovo file `ARCHITECTURE.md` che spiega pipeline di ricerca, ruolo di ogni classe, strategie di resilienza e motivazioni delle scelte di design.
 - 🐍 **Check versione Python**: se il plugin viene caricato su Python < 3.8, solleva un errore chiaro all'avvio invece di fallire in modo oscuro.
 - 🐛 **Bug fix minori**: `_RateLimiter` espone `current` come property thread-safe; il circuit breaker IMDb riceve correttamente `record_success`/`record_failure` in base all'esito delle chiamate.
@@ -71,46 +70,64 @@ Tutte le costanti principali sono modificabili direttamente nel file, senza tocc
 | `IMDB_CB_FAIL_THRESHOLD` | `5` | Fallimenti IMDb consecutivi prima di aprire il circuit breaker |
 | `IMDB_CB_RECOVERY_TIMEOUT` | `60.0` | Secondi di attesa prima del tentativo di recupero IMDb |
 
-## ⚙️ Come Installare (Metodo Web Link)
+## ⚙️ Come Installare
 
-Per installare questo plugin, non è necessario scaricare alcun file manualmente. Ti basta usare la funzione di importazione web di qBittorrent.
+Ci sono due modi per installare il plugin. Entrambi richiedono che qBittorrent abbia il **motore di ricerca abilitato** e che **Python** sia installato sul sistema.
 
-1. Apri **qBittorrent**.
-   > **Nota**: Se non vedi la scheda *Ricerca*, vai nel menu in alto: **Visualizza → Spunta Motore di ricerca** (affinché funzioni, devi avere Python 3 installato sul tuo sistema).
+### Prerequisiti
 
-2. Vai sulla scheda **Ricerca** e clicca sul pulsante **Plugin di ricerca...** in basso a destra.
+1. **qBittorrent 4.4 o superiore** (consigliata la versione 5.x).
+2. **Python 3.8+** installato. Su Windows, le versioni recenti di qBittorrent (5.0+) richiedono **Python 3.13** per far funzionare i plugin di ricerca. Se non hai Python, scaricalo da [python.org](https://www.python.org/downloads/) e assicurati di spuntare **"Add Python to PATH"** durante l'installazione.
+3. **Scheda Ricerca abilitata**: se non la vedi, vai nel menu in alto **Visualizza → Motore di ricerca**.
 
-3. Clicca su **Installa un nuovo plugin** e seleziona l'opzione **Web link**.
+### Metodo A — Web Link (consigliato)
 
-4. Incolla il link "Raw" ufficiale del file:
+Questo metodo è il più semplice: qBittorrent scarica il plugin direttamente dal repository e lo tiene aggiornabile.
+
+1. Nella scheda **Ricerca**, clicca sul pulsante **Plugin di ricerca...** in basso a destra.
+2. Clicca su **Installa un nuovo plugin** e seleziona **Web link**.
+3. Incolla il link "Raw" ufficiale:
 https://raw.githubusercontent.com/gigio820373/qbittorrent-torrentio-plugin/main/torrentio.py
 
 text
+4. Clicca **OK**. Il plugin **"Torrentio Ultra ITA"** apparirà nella lista.
 
-5. Clicca su **OK**. Il plugin **"Torrentio Ultra ITA"** apparirà istantaneamente nella lista.
+> **Nota sugli aggiornamenti**: il plugin installato via Web Link può essere aggiornato comodamente. Ti basterà aprire la finestra dei plugin in qBittorrent e cliccare su **Controlla aggiornamenti**.
 
-## 🔄 Aggiornamenti
+### Metodo B — File locale
 
-Dato che il plugin viene installato tramite Web Link, potrai aggiornarlo comodamente in futuro. Ti basterà aprire la finestra dei plugin in qBittorrent e cliccare su **Controlla aggiornamenti**.
+Utile se preferisci scaricare il file manualmente o se il link diretto non è raggiungibile.
 
-Se hai modificato il codice localmente e vuoi forzare l'aggiornamento all'ultima versione del repository, disinstalla e reinstalla il plugin dal Web Link.
+1. Apri il link del plugin nel browser:
+https://raw.githubusercontent.com/gigio820373/qbittorrent-torrentio-plugin/main/torrentio.py
+
+text
+2. Salva la pagina con **"Salva con nome..."** e assicurati che il file abbia estensione **`.py`** (es. `torrentio.py`). Se il browser salva come `.txt`, rinominalo.
+3. In qBittorrent, vai nella scheda **Ricerca** e clicca **Plugin di ricerca...**.
+4. Clicca **Installa un nuovo plugin** e seleziona **File locale**.
+5. Seleziona il file `torrentio.py` che hai appena salvato. Il plugin apparirà nella lista.
+
+Per aggiornare in futuro con questo metodo, ripeti i passaggi: scarica la nuova versione e reinstallala sopra quella vecchia.
+
+### Verifica che funzioni
+
+Dopo l'installazione, fai una ricerca di prova (es. `Il Padrino 1972`). Se compaiono risultati, il plugin è correttamente installato e Python è configurato bene. Se la ricerca non restituisce nulla:
+
+- Controlla di avere Python installato e nel `PATH`.
+- Attiva `DEBUG = True` nel file del plugin, ripeti la ricerca e controlla il file di log in `/tmp/torrentio_ultra.log` (su Windows, `%TEMP%\torrentio_ultra.log`).
+- Se il file di log non viene creato, il plugin non è stato caricato correttamente: verifica la versione di Python e reinstalla.
 
 ## 🛠️ Sviluppo e Test
 
-Il plugin è testato con `unittest` (standard library) e non richiede dipendenze esterne. La suite copre parsing query, estrazione metadati, deduplica, costruzione magnet, circuit breaker e pipeline end-to-end (con rete mockata).
+Per dettagli su architettura, flusso di una ricerca, strategie di resilienza e decisioni di design, vedi [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-```bash
-git clone https://github.com/gigio820373/qbittorrent-torrentio-plugin.git
-cd qbittorrent-torrentio-plugin
-python -m unittest discover -s tests -v
-Tutti i test girano in pochi secondi senza mai toccare la rete.
+## 🐛 Segnalazioni e Contributi
 
-Per dettagli su architettura, flusso di una ricerca, strategie di resilienza e decisioni di design, vedi ARCHITECTURE.md.
+Se trovi un bug o vuoi suggerire una funzionalità, apri una **Issue** su GitHub. Se vuoi contribuire con una modifica, apri una **Pull Request**.
 
-🐛 Segnalazioni e Contributi
-Se trovi un bug o vuoi suggerire una funzionalità, apri una Issue su GitHub. Se vuoi contribuire con una modifica, apri una Pull Request.
+Prima di segnalare un problema, attiva `DEBUG = True` nel file, riproduci l'errore e allega il contenuto di `/tmp/torrentio_ultra.log`: aiuta tantissimo a capire cosa è andato storto.
 
-Prima di segnalare un problema, attiva DEBUG = True nel file, riproduci l'errore e allega il contenuto di /tmp/torrentio_ultra.log: aiuta tantissimo a capire cosa è andato storto.
+## 📜 Disclaimer
 
-📜 Disclaimer
-Questo progetto è open-source, rilasciato sotto licenza GPL v3 e sviluppato esclusivamente a scopo educativo. Non ospita né trasmette file coperti da copyright.
+Questo progetto è open-source, rilasciato sotto licenza **GPL v3** e sviluppato esclusivamente a scopo educativo. Non ospita né trasmette file coperti da copyright.
+
