@@ -1,13 +1,7 @@
 # VERSION: 3.00
 # AUTHORS: gigio820373
 # LICENSING INFORMATION: GPL v3
-# DESCRIZIONE: Torrentio Ultra ITA: ricerca IMDb nativa (zero API) + multithreading
-#              + season pack + filtri query + rate limit adattivo + fallback Cloudflare
-#              + caching + timeout globale + SELF-HEALING (istanze multiple con blacklist)
-#              + sort=qualitysize + qualityfilter esteso + proxy multipli con rotazione
-#              + estrazione codec/audio + deduplica intelligente + refactoring
-#              + CIRCUIT BREAKER su IMDb + TORRENTIO CLIENT separato
-#              + ParsedStream tipizzato + CHECK VERSIONE PYTHON all'avvio.
+# DESCRIZIONE: Torrentio Ultra ITA
 
 import concurrent.futures
 import datetime
@@ -25,7 +19,6 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-# --- Punto 6: controllo esplicito della versione Python -----------------
 if sys.version_info < (3, 8):
     raise RuntimeError(
         "Torrentio Ultra ITA richiede Python 3.8 o superiore "
@@ -36,12 +29,7 @@ if sys.version_info < (3, 8):
 from novaprinter import prettyPrinter
 
 
-# ----------------------------------------------------------------------
-# Helper thread-safe
-# ----------------------------------------------------------------------
-
 class _RateLimiter(object):
-    """Serializza le chiamate HTTP. Adattivo: escalate() su 429, relax() su successo."""
 
     def __init__(self, interval, max_interval=5.0):
         self.interval = interval
@@ -99,7 +87,6 @@ class _TTLCache(object):
 
 
 class _InstanceHealth(object):
-    """Blacklist temporanea delle istanze Torrentio con stato persistente."""
 
     def __init__(self, fail_threshold=2, cooldown=120):
         self.fail_threshold = fail_threshold
@@ -151,13 +138,6 @@ class _InstanceHealth(object):
 
 
 class _CircuitBreaker(object):
-    """Circuit breaker a tre stati per proteggere endpoint instabili.
-
-    CLOSED    -> le richieste passano normalmente.
-    OPEN      -> le richieste falliscono subito senza toccare la rete.
-    HALF_OPEN -> viene concessa una singola richiesta di prova; in base
-                 all'esito si torna CLOSED o si riapre OPEN.
-    """
 
     CLOSED = 'closed'
     OPEN = 'open'
@@ -202,15 +182,8 @@ class _CircuitBreaker(object):
                 self._opened_at = time.monotonic()
 
 
-# --- Punto 4: contratto esplicito per i metadati estratti da Torrentio
 @dataclass(frozen=True)
 class ParsedStream:
-    """Risultato del parsing di uno stream restituito da Torrentio.
-
-    Ogni campo e' tipizzato ed esplicito: se aggiungi una nuova metrica
-    (es. HDR) devi aggiungerla qui, e il type checker ti dice subito
-    dove va consumata.
-    """
     first_line: str
     quality: str
     tracker: str
@@ -222,20 +195,7 @@ class ParsedStream:
     seeds: str
 
 
-# --- Punto 3: client HTTP Torrentio separato dall'orchestratore
 class _TorrentioClient(object):
-    """Incapsula tutta la logica di rete verso Torrentio.
-
-    Responsabilita':
-      - provare le istanze in ordine di salute;
-      - su 403 tentare i proxy configurati;
-      - su errori transitori tentare un URL "pulito" (senza filtri);
-      - aggiornare l'health tracker.
-
-    Non conosce il rate limiter, la cache, o il parsing: quelle sono
-    responsabilita' dell'orchestratore (`torrentio`). Questo permette di
-    testare il client in isolamento iniettando un finto `http_json`.
-    """
 
     def __init__(self, http_json, base_url_builder, logger,
                  health_tracker=None, proxy_urls=None,
@@ -251,7 +211,6 @@ class _TorrentioClient(object):
         self._fallback_on_block = fallback_on_block
 
     def fetch_stream(self, instances, path):
-        """Ritorna (streams, error). error=None indica successo."""
         ordered = (
             self._health.get_ordered_instances(instances)
             if self._health is not None else list(instances)
@@ -339,10 +298,6 @@ class torrentio(object):
         'anime': 'anime'
     }
 
-    # ------------------------------------------------------------------
-    # CONFIGURAZIONE
-    # ------------------------------------------------------------------
-
     DEBUG = False
     ONLY_ITA = False
     USE_ITA_FLAG = True
@@ -397,7 +352,6 @@ class torrentio(object):
     GLOBAL_TIMEOUT = 90
     SMART_DEDUP = True
 
-    # --- Punto 2: circuit breaker per IMDb ---
     IMDB_CB_FAIL_THRESHOLD = 5
     IMDB_CB_RECOVERY_TIMEOUT = 60.0
 
@@ -413,10 +367,6 @@ class torrentio(object):
         ('Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) '
          'Gecko/20100101 Firefox/125.0'),
     ]
-
-    # ------------------------------------------------------------------
-    # Costanti interne
-    # ------------------------------------------------------------------
 
     FALLBACK_TRACKERS = [
         'udp://tracker.opentrackr.org:1337/announce',
@@ -471,7 +421,6 @@ class torrentio(object):
         re.IGNORECASE
     )
 
-    # Stato condiviso a livello di classe
     _shared_lock = threading.Lock()
     _health_shared = None
     _rate_limiter_shared = None
@@ -486,10 +435,6 @@ class torrentio(object):
         self._rate_limiter = self._get_or_create_rate_limiter() if self.RATE_LIMIT_ENABLED else None
         self._imdb_cb = self._get_or_create_imdb_circuit_breaker()
         self._init_caches()
-
-    # ------------------------------------------------------------------
-    # Inizializzazione lazy degli stati condivisi
-    # ------------------------------------------------------------------
 
     @classmethod
     def _get_or_create_health(cls):
@@ -526,10 +471,6 @@ class torrentio(object):
             if cls._stream_cache is None and cls.CACHE_ENABLED:
                 cls._stream_cache = _TTLCache(cls.CACHE_TTL_STREAM)
 
-    # ------------------------------------------------------------------
-    # Utilita' di base
-    # ------------------------------------------------------------------
-
     def _build_base_url(self, base):
         options = []
         if self.PROVIDERS:
@@ -561,7 +502,6 @@ class torrentio(object):
             pass
 
     def _http_json(self, url, headers=None, timeout=None, retries=None, throttle=False):
-        """GET + parse JSON. Restituisce (data, error_type)."""
         timeout = timeout or self.HTTP_TIMEOUT
         retries = self.HTTP_RETRIES if retries is None else retries
         hdrs = self._get_headers()
@@ -602,10 +542,6 @@ class torrentio(object):
                     continue
                 return None, err
         return None, 'unknown'
-
-    # ------------------------------------------------------------------
-    # Parsing della query
-    # ------------------------------------------------------------------
 
     def _extract_season_episode(self, query):
         match = self.RE_SE_FULL.search(query)
@@ -657,10 +593,6 @@ class torrentio(object):
         normalized = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
         return re.sub(r'[^a-z0-9_]+', '_', normalized.lower()).strip('_')
 
-    # ------------------------------------------------------------------
-    # Ricerca titolo
-    # ------------------------------------------------------------------
-
     def _make_item(self, ref, title, year, is_series, path_type, desc_link):
         return {
             'id': ref,
@@ -695,7 +627,6 @@ class torrentio(object):
                     items.append(self._make_item(imdb_id, imdb_id, '', kind == 'series', kind, link))
             return items
 
-        # --- Punto 2: circuit breaker prima di toccare la rete ---
         if not self._imdb_cb.allow_request():
             self._log('circuit breaker IMDb aperto: salto la ricerca')
             return []
@@ -801,10 +732,6 @@ class torrentio(object):
                 return items
         return []
 
-    # ------------------------------------------------------------------
-    # Richieste Torrentio con self-healing + proxy multipli
-    # ------------------------------------------------------------------
-
     def _make_request(self, item, season, episode):
         if not item['is_series']:
             return {
@@ -838,9 +765,6 @@ class torrentio(object):
         }
 
     def _get_torrentio_client(self):
-        """Costruisce un client Torrentio con le dipendenze correnti.
-        Leggero: e' intenzionalmente ricreato a ogni ricerca per riflettere
-        eventuali modifiche runtime delle costanti di classe."""
         return _TorrentioClient(
             http_json=self._http_json,
             base_url_builder=self._build_base_url,
@@ -875,10 +799,6 @@ class torrentio(object):
 
         return req, streams
 
-    # ------------------------------------------------------------------
-    # Costruzione magnet
-    # ------------------------------------------------------------------
-
     def _build_magnet(self, stream, display_name):
         if stream.get('magnet'):
             return stream['magnet']
@@ -897,10 +817,6 @@ class torrentio(object):
         encoded_name = urllib.parse.quote(display_name)
         tr_params = ''.join('&tr={}'.format(urllib.parse.quote(tr)) for tr in trackers[:15])
         return 'magnet:?xt=urn:btih:{}&dn={}{}'.format(info_hash, encoded_name, tr_params)
-
-    # ------------------------------------------------------------------
-    # Estrazione metadati
-    # ------------------------------------------------------------------
 
     def _parse_size(self, text):
         match = self.RE_SIZE.search(text)
@@ -956,7 +872,6 @@ class torrentio(object):
         return '|'.join(tags)
 
     def _extract_metadata(self, stream, req, filters):
-        """Restituisce un ParsedStream oppure None se lo stream va scartato."""
         item = req['item']
         raw_title = str(stream.get('title') or '')
         lines = [line.strip() for line in raw_title.split('\n') if line.strip()]
@@ -1027,10 +942,6 @@ class torrentio(object):
             'pub_date': '-1'
         }
 
-    # ------------------------------------------------------------------
-    # Deduplica intelligente
-    # ------------------------------------------------------------------
-
     def _dedup_key(self, stream, packet):
         info_hash = str(stream.get('infoHash') or '').lower()
         if not self.SMART_DEDUP:
@@ -1047,10 +958,6 @@ class torrentio(object):
             return int(packet.get('seeds', '0'))
         except (TypeError, ValueError):
             return 0
-
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
 
     def search(self, what, cat='all'):
         start_time = time.monotonic()
