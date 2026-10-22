@@ -1,23 +1,13 @@
-# VERSION: 3.00
+# VERSION: 3.08
 # AUTHORS: gigio820373
 # LICENSING INFORMATION: GPL v3
-# DESCRIZIONE: Torrentio Ultra ITA
+# DESCRIZIONE: Torrentio Ultra ITA — v3.08
+#              + CONFIGURAZIONE AUTOMATICA (torrentio.json accanto al plugin)
+#              + PERSISTENZA STATO (torrentio_state.json in tempdir)
+#              + scrittura atomica, gestione JSON malformato, whitelist chiavi.
+#              Tutte le funzionalità della v3.07 restano invariate.
 
-import concurrent.futures
-import datetime
-import json
-import os
-import random
-import re
 import sys
-import tempfile
-import threading
-import time
-import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass, field
 
 if sys.version_info < (3, 8):
     raise RuntimeError(
@@ -26,11 +16,116 @@ if sys.version_info < (3, 8):
         "con Python piu' recente.".format(*sys.version_info[:2])
     )
 
+import concurrent.futures
+import datetime
+import json
+import os
+import random
+import re
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+
 from novaprinter import prettyPrinter
 
 
-class _RateLimiter(object):
+RE_BTIH_HEX = re.compile(r'^[0-9a-fA-F]{40}$')
+RE_BTIH_BASE32 = re.compile(r'^[A-Z2-7a-z2-7]{32}$')
 
+
+def _validate_info_hash(info_hash):
+    if not info_hash or not isinstance(info_hash, str):
+        return None
+    h = info_hash.strip()
+    if RE_BTIH_HEX.match(h):
+        return h.lower()
+    if RE_BTIH_BASE32.match(h):
+        return h
+    return None
+
+
+def _validate_magnet(magnet):
+    if not magnet or not isinstance(magnet, str):
+        return None
+    m = magnet.strip()
+    if not m.startswith('magnet:?xt=urn:btih:'):
+        return None
+    try:
+        rest = m[len('magnet:?xt=urn:btih:'):]
+        hash_part = rest.split('&', 1)[0]
+    except Exception:
+        return None
+    if not _validate_info_hash(hash_part):
+        return None
+    return m
+
+
+# ----------------------------------------------------------------------
+# Configurazione persistente — torrentio.json accanto al plugin
+# ----------------------------------------------------------------------
+
+# Whitelist delle costanti che possono essere sovrascritte da torrentio.json.
+# Nomi di costanti NON in questa lista vengono ignorati.
+CONFIGURABLE_KEYS = {
+    'DEBUG', 'ONLY_ITA', 'ONLY_ITA_AUDIO', 'USE_ITA_FLAG', 'TRUST_LANGUAGE_FILTER',
+    'PROVIDERS', 'QUALITY_FILTER', 'TORRENTIO_SORT', 'LIMIT',
+    'USE_KITSU_FOR_ANIME', 'MAX_TITLES', 'MAX_WORKERS', 'QUERY_FALLBACKS',
+    'HTTP_TIMEOUT', 'HTTP_RETRIES',
+    'RATE_LIMIT_ENABLED', 'RATE_LIMIT_INTERVAL', 'RATE_LIMIT_ADAPTIVE',
+    'SELF_HEALING_ENABLED', 'HEALTH_FAIL_THRESHOLD', 'HEALTH_COOLDOWN', 'FALLBACK_ON_BLOCK',
+    'USE_PROXY_ON_BLOCK', 'PROXY_TIMEOUT',
+    'CACHE_ENABLED', 'CACHE_TTL_IMDB', 'CACHE_TTL_STREAM',
+    'GLOBAL_TIMEOUT', 'SMART_DEDUP',
+    'SEARCH_ALL_SEASONS', 'MAX_SEASONS',
+    'SHOW_RELEASE_SUFFIX', 'SHOW_TRACKER_IN_NAME', 'SHOW_AUDIO_INFO',
+    'SORT_STRATEGY', 'MIN_SEEDS_FOR_PRIORITY',
+    'MIN_RESOLUTION', 'STRICT_RESOLUTION',
+    'IMDB_CB_FAIL_THRESHOLD', 'IMDB_CB_RECOVERY_TIMEOUT',
+}
+
+
+def _plugin_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def _state_dir():
+    try:
+        return tempfile.gettempdir()
+    except Exception:
+        return _plugin_dir()
+
+
+def _atomic_write_json(path, data):
+    """Scrive JSON in modo atomico: tmp + os.replace. Restituisce True se ok."""
+    try:
+        d = os.path.dirname(path) or '.'
+        if not os.path.isdir(d):
+            return False
+        fd, tmp = tempfile.mkstemp(prefix='.torrentio_', suffix='.tmp', dir=d)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+            os.replace(tmp, path)
+            return True
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            return False
+    except Exception:
+        return False
+
+
+class _RateLimiter(object):
     def __init__(self, interval, max_interval=5.0):
         self.interval = interval
         self.max_interval = max_interval
@@ -45,11 +140,11 @@ class _RateLimiter(object):
 
     def wait(self):
         with self._lock:
-            now = time.monotonic()
+            now = time.time()
             delta = now - self._last
             if delta < self._current:
                 time.sleep(self._current - delta)
-            self._last = time.monotonic()
+            self._last = time.time()
 
     def escalate(self):
         with self._lock:
@@ -59,35 +154,75 @@ class _RateLimiter(object):
         with self._lock:
             self._current = max(self.interval, self._current * 0.9)
 
+    def to_dict(self):
+        with self._lock:
+            return {'current': self._current}
+
+    def load_dict(self, data):
+        try:
+            c = float(data.get('current', self.interval))
+            with self._lock:
+                self._current = max(self.interval, min(c, self.max_interval))
+        except (TypeError, ValueError):
+            pass
+
 
 class _TTLCache(object):
     def __init__(self, ttl):
         self.ttl = ttl
         self._lock = threading.Lock()
-        self._store = {}
+        self._store = {}  # key -> (value, expires_at)
 
     def get(self, key):
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
                 return None
-            value, ts = entry
-            if (time.monotonic() - ts) > self.ttl:
+            value, expires_at = entry
+            if time.time() > expires_at:
                 del self._store[key]
                 return None
             return value
 
     def set(self, key, value):
         with self._lock:
-            self._store[key] = (value, time.monotonic())
+            self._store[key] = (value, time.time() + self.ttl)
+            if len(self._store) > 500:
+                now = time.time()
+                self._store = {k: v for k, v in self._store.items() if v[1] > now}
 
     def clear(self):
         with self._lock:
             self._store.clear()
 
+    def to_dict(self):
+        with self._lock:
+            now = time.time()
+            items = []
+            for k, (v, exp) in self._store.items():
+                if exp > now:
+                    items.append({'k': list(k) if isinstance(k, tuple) else k,
+                                  'v': v, 'exp': exp})
+            return {'items': items, 'ttl': self.ttl}
+
+    def load_dict(self, data):
+        try:
+            items = data.get('items', [])
+            now = time.time()
+            with self._lock:
+                for it in items:
+                    k = it.get('k')
+                    if isinstance(k, list):
+                        k = tuple(k)
+                    v = it.get('v')
+                    exp = float(it.get('exp', 0))
+                    if exp > now and k is not None:
+                        self._store[k] = (v, exp)
+        except Exception:
+            pass
+
 
 class _InstanceHealth(object):
-
     def __init__(self, fail_threshold=2, cooldown=120):
         self.fail_threshold = fail_threshold
         self.cooldown = cooldown
@@ -99,7 +234,7 @@ class _InstanceHealth(object):
             state = self._state.get(url)
             if state is None:
                 return True
-            return state.get('blocked_until', 0) <= time.monotonic()
+            return state.get('blocked_until', 0) <= time.time()
 
     def record_success(self, url):
         with self._lock:
@@ -107,7 +242,7 @@ class _InstanceHealth(object):
 
     def record_failure(self, url, error_type):
         with self._lock:
-            now = time.monotonic()
+            now = time.time()
             state = self._state.setdefault(url, {'fails': 0, 'blocked_until': 0, 'last_error': None})
             if state['blocked_until'] > 0 and state['blocked_until'] <= now:
                 state['fails'] = 0
@@ -121,7 +256,7 @@ class _InstanceHealth(object):
 
     def get_ordered_instances(self, instances):
         with self._lock:
-            now = time.monotonic()
+            now = time.time()
             healthy, recovering = [], []
             for url in instances:
                 state = self._state.get(url)
@@ -132,13 +267,21 @@ class _InstanceHealth(object):
             recovering.sort(key=lambda x: x[1])
             return healthy + [u for u, _ in recovering]
 
-    def snapshot(self):
+    def to_dict(self):
         with self._lock:
-            return {u: dict(s) for u, s in self._state.items()}
+            return {'state': {u: dict(s) for u, s in self._state.items()}}
+
+    def load_dict(self, data):
+        try:
+            st = data.get('state', {})
+            if isinstance(st, dict):
+                with self._lock:
+                    self._state = {u: dict(v) for u, v in st.items() if isinstance(v, dict)}
+        except Exception:
+            pass
 
 
 class _CircuitBreaker(object):
-
     CLOSED = 'closed'
     OPEN = 'open'
     HALF_OPEN = 'half_open'
@@ -149,6 +292,7 @@ class _CircuitBreaker(object):
         self._state = self.CLOSED
         self._failures = 0
         self._opened_at = 0.0
+        self._half_open_taken = False
         self._lock = threading.Lock()
 
     @property
@@ -158,28 +302,57 @@ class _CircuitBreaker(object):
 
     def allow_request(self):
         with self._lock:
-            now = time.monotonic()
+            now = time.time()
             if self._state == self.OPEN:
                 if now - self._opened_at >= self.recovery_timeout:
                     self._state = self.HALF_OPEN
+                    self._half_open_taken = True
                     return True
                 return False
+            if self._state == self.HALF_OPEN:
+                if self._half_open_taken:
+                    return False
+                self._half_open_taken = True
+                return True
             return True
 
     def record_success(self):
         with self._lock:
             self._failures = 0
             self._state = self.CLOSED
+            self._half_open_taken = False
 
     def record_failure(self):
         with self._lock:
             self._failures += 1
             if self._state == self.HALF_OPEN:
                 self._state = self.OPEN
-                self._opened_at = time.monotonic()
+                self._opened_at = time.time()
+                self._half_open_taken = False
             elif self._failures >= self.fail_threshold:
                 self._state = self.OPEN
-                self._opened_at = time.monotonic()
+                self._opened_at = time.time()
+
+    def to_dict(self):
+        with self._lock:
+            return {
+                'state': self._state,
+                'failures': self._failures,
+                'opened_at': self._opened_at,
+                'half_open_taken': self._half_open_taken,
+            }
+
+    def load_dict(self, data):
+        try:
+            with self._lock:
+                self._state = data.get('state', self.CLOSED)
+                self._failures = int(data.get('failures', 0))
+                self._opened_at = float(data.get('opened_at', 0))
+                self._half_open_taken = bool(data.get('half_open_taken', False))
+                if self._state not in (self.CLOSED, self.OPEN, self.HALF_OPEN):
+                    self._state = self.CLOSED
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -188,15 +361,17 @@ class ParsedStream:
     quality: str
     tracker: str
     is_ita: bool
+    is_multi: bool
     is_sub: bool
     is_pack: bool
     codec: str
+    audio: str
+    resolution: str
     size_bytes: str
     seeds: str
 
 
 class _TorrentioClient(object):
-
     def __init__(self, http_json, base_url_builder, logger,
                  health_tracker=None, proxy_urls=None,
                  use_proxy_on_block=True, proxy_timeout=8,
@@ -226,7 +401,6 @@ class _TorrentioClient(object):
                 self._health.record_failure(base, error)
             last_error = error
             self._logger('istanza {} in errore ({}), passo alla successiva'.format(base, error))
-        self._logger('tutte le istanze Torrentio hanno fallito per {}'.format(path))
         return [], last_error
 
     def _apply_proxy(self, url, template):
@@ -243,17 +417,23 @@ class _TorrentioClient(object):
             return None, 'blocked'
         for template in self._proxy_urls:
             proxy_url = self._apply_proxy(target_url, template)
-            self._logger('provo proxy: {}'.format(proxy_url))
             data, error = self._http_json(
                 proxy_url, timeout=self._proxy_timeout, retries=0, throttle=False
             )
             if error is None:
                 streams = data.get('streams') if isinstance(data, dict) else None
                 if isinstance(streams, list):
-                    self._logger('proxy {} riuscito'.format(template.split('{')[0]))
                     return streams, None
-            self._logger('proxy fallito ({}): passo al successivo'.format(error))
         return None, 'blocked'
+
+    def _should_try_clean_url(self, error):
+        if not error:
+            return False
+        if error == 'invalid_json':
+            return True
+        if error.startswith('http_4'):
+            return True
+        return False
 
     def _try_instance(self, base, path):
         url = '{}/stream/{}.json'.format(self._base_url_builder(base), path)
@@ -271,9 +451,8 @@ class _TorrentioClient(object):
         if error == 'ratelimit':
             return None, error
 
-        if self._fallback_on_block:
+        if self._fallback_on_block and self._should_try_clean_url(error):
             fallback_url = '{}/stream/{}.json'.format(base.rstrip('/'), path)
-            self._logger('fallback URL pulito su {} per {}'.format(base, path))
             data2, error2 = self._http_json(fallback_url, throttle=True)
             if error2 is None:
                 streams = data2.get('streams') if isinstance(data2, dict) else None
@@ -298,9 +477,17 @@ class torrentio(object):
         'anime': 'anime'
     }
 
+    # --- Persistenza e configurazione automatica ---
+    CONFIG_ENABLED = True
+    CONFIG_FILENAME = 'torrentio.json'
+    PERSIST_STATE = True
+    STATE_FILENAME = 'torrentio_state.json'
+
     DEBUG = False
     ONLY_ITA = False
+    ONLY_ITA_AUDIO = False
     USE_ITA_FLAG = True
+    TRUST_LANGUAGE_FILTER = True
 
     TORRENTIO_INSTANCES = [
         'https://torrentio.strem.fun',
@@ -312,13 +499,13 @@ class torrentio(object):
         "torrentgalaxy,ilcorsaronero,magnetdl,nyaasi"
     )
 
-    QUALITY_FILTER = '480p,other,scr,cam,unknown'
+    QUALITY_FILTER = '480p,other,scr,cam'
     TORRENTIO_SORT = 'qualitysize'
     LIMIT = ''
 
     USE_KITSU_FOR_ANIME = False
 
-    MAX_TITLES = 4
+    MAX_TITLES = 8
     MAX_WORKERS = 4
     QUERY_FALLBACKS = 2
     HTTP_TIMEOUT = 10
@@ -348,9 +535,22 @@ class torrentio(object):
     CACHE_TTL_IMDB = 3600
     CACHE_TTL_STREAM = 300
 
-    SORT_BY_SEEDS = True
     GLOBAL_TIMEOUT = 90
     SMART_DEDUP = True
+
+    SEARCH_ALL_SEASONS = False
+    MAX_SEASONS = 10
+
+    SHOW_RELEASE_SUFFIX = False
+    SHOW_TRACKER_IN_NAME = False
+    SHOW_AUDIO_INFO = True
+
+    SORT_STRATEGY = 'ita_then_size'
+    MIN_SEEDS_FOR_PRIORITY = 0
+
+    MIN_RESOLUTION = '1080p'
+    STRICT_RESOLUTION = False
+    RESOLUTION_PRIORITY = ['4k', '1440p', '1080p', '720p', '480p', '360p', 'unknown']
 
     IMDB_CB_FAIL_THRESHOLD = 5
     IMDB_CB_RECOVERY_TIMEOUT = 60.0
@@ -401,16 +601,23 @@ class torrentio(object):
     RE_EP_TAG = re.compile(r'\bs\d{1,2}[\s._-]?e\d{1,3}\b|\b\d{1,2}x\d{2,3}\b', re.IGNORECASE)
     RE_SUB_ITA = re.compile(r'\b(?:sub[\s._-]?ita|vost[\s._-]?ita)\b', re.IGNORECASE)
     RE_AUDIO_ITA = re.compile(r'\b(?:ita|italian)\b', re.IGNORECASE)
+    RE_NON_ITA_LANG = re.compile(
+        r'\b(?:eng|english|fra|french|deu|german|spa|spanish|jpn|japanese|rus|russian)\b',
+        re.IGNORECASE
+    )
+    RE_PREMIUM_AUDIO = re.compile(
+        r'\btruehd\b|\bdts[\s._-]?hd[\s._-]?ma\b|\bdts[\s._-]?hd\b|\batmos\b',
+        re.IGNORECASE
+    )
     RE_TRACKER = re.compile(r'\u2699\ufe0f?\s*([^\n\r]+)')
     RE_SEEDS = re.compile(r'\U0001F464\s*(\d+)')
     RE_SIZE = re.compile(r'\U0001F4BE\s*([\d.]+)\s*([KMGT])i?B', re.IGNORECASE)
 
     RE_CODEC = re.compile(r'\b(h[\s._-]?265|hevc|x265|h[\s._-]?264|x264|av1)\b', re.IGNORECASE)
-    RE_AUDIO_CODEC = re.compile(
-        r'\b(aac|e?ac3|ddp?[\s._-]?[257][\s._-]?[01]|dts[\s._-]?(?:hd|x)?|truehd|atmos)\b',
+    RE_RESOLUTION = re.compile(
+        r'\b(2160p|4k|uhd|1440p|2k|1080p|720p|480p|360p)\b',
         re.IGNORECASE
     )
-    RE_MULTI = re.compile(r'\b(multi|dual[\s._-]?audio|doppio[\s._-]?audio)\b', re.IGNORECASE)
 
     RE_DEDUP_STRIP = re.compile(
         r'\b(?:ita|italian|italiano|sub[\s._-]?ita|multi|dual[\s._-]?audio|'
@@ -427,14 +634,129 @@ class torrentio(object):
     _imdb_cache = None
     _stream_cache = None
     _imdb_circuit_breaker = None
+    _state_lock = threading.Lock()
 
     def __init__(self):
         if not self.TORRENTIO_INSTANCES:
             raise ValueError('TORRENTIO_INSTANCES non puo\' essere vuota')
+
+        # --- Config automatica ---
+        if self.CONFIG_ENABLED:
+            self._auto_load_config()
+
+        # --- Init componenti ---
         self._health_tracker = self._get_or_create_health() if self.SELF_HEALING_ENABLED else None
         self._rate_limiter = self._get_or_create_rate_limiter() if self.RATE_LIMIT_ENABLED else None
         self._imdb_cb = self._get_or_create_imdb_circuit_breaker()
         self._init_caches()
+
+        # --- Carica stato persistito ---
+        if self.PERSIST_STATE:
+            self._auto_load_state()
+
+    # ------------------------------------------------------------------
+    # Config automatica
+    # ------------------------------------------------------------------
+
+    def _config_path(self):
+        return os.path.join(_plugin_dir(), self.CONFIG_FILENAME)
+
+    def _auto_load_config(self):
+        path = self._config_path()
+        if not os.path.isfile(path):
+            try:
+                defaults = {k: getattr(type(self), k) for k in CONFIGURABLE_KEYS
+                            if hasattr(type(self), k)}
+                payload = {
+                    '_comment': (
+                        'Configurazione Torrentio Ultra ITA. '
+                        'Modifica i valori qui sotto: sovrascrivono i default '
+                        'del plugin e NON vengono toccati dagli aggiornamenti.'
+                    ),
+                    '_documentazione': (
+                        'https://github.com/gigio820373/qbittorrent-torrentio-plugin'
+                    ),
+                }
+                payload.update(defaults)
+                _atomic_write_json(path, payload)
+            except Exception:
+                pass
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            # JSON malformato: ignora, non toccare il file
+            return
+        if not isinstance(data, dict):
+            return
+        for key, value in data.items():
+            if key.startswith('_'):
+                continue
+            if key not in CONFIGURABLE_KEYS:
+                continue
+            try:
+                setattr(type(self), key, value)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Persistenza stato
+    # ------------------------------------------------------------------
+
+    def _state_path(self):
+        return os.path.join(_state_dir(), self.STATE_FILENAME)
+
+    def _auto_load_state(self):
+        path = self._state_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            if self._rate_limiter is not None and 'rate_limiter' in data:
+                self._rate_limiter.load_dict(data['rate_limiter'])
+            if self._imdb_cache is not None and 'imdb_cache' in data:
+                self._imdb_cache.load_dict(data['imdb_cache'])
+            if self._stream_cache is not None and 'stream_cache' in data:
+                self._stream_cache.load_dict(data['stream_cache'])
+            if self._health_tracker is not None and 'health' in data:
+                self._health_tracker.load_dict(data['health'])
+            if self._imdb_cb is not None and 'imdb_cb' in data:
+                self._imdb_cb.load_dict(data['imdb_cb'])
+        except Exception:
+            pass
+
+    def _auto_save_state(self):
+        if not self.PERSIST_STATE:
+            return
+        try:
+            data = {}
+            if self._rate_limiter is not None:
+                data['rate_limiter'] = self._rate_limiter.to_dict()
+            if self._imdb_cache is not None:
+                data['imdb_cache'] = self._imdb_cache.to_dict()
+            if self._stream_cache is not None:
+                data['stream_cache'] = self._stream_cache.to_dict()
+            if self._health_tracker is not None:
+                data['health'] = self._health_tracker.to_dict()
+            if self._imdb_cb is not None:
+                data['imdb_cb'] = self._imdb_cb.to_dict()
+            data['_saved_at'] = time.time()
+            data['_pid'] = os.getpid()
+            _atomic_write_json(self._state_path(), data)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Inizializzazione lazy stati condivisi
+    # ------------------------------------------------------------------
 
     @classmethod
     def _get_or_create_health(cls):
@@ -497,7 +819,7 @@ class torrentio(object):
         try:
             path = os.path.join(tempfile.gettempdir(), 'torrentio_ultra.log')
             with open(path, 'a', encoding='utf-8') as f:
-                f.write(time.strftime('%H:%M:%S ') + msg + '\n')
+                f.write('pid={} {}'.format(os.getpid(), time.strftime('%H:%M:%S ')) + msg + '\n')
         except OSError:
             pass
 
@@ -609,10 +931,9 @@ class torrentio(object):
             cache_key = ('imdb', self._normalize_slug(query) or query, tuple(sorted(kinds)))
             cached = self._imdb_cache.get(cache_key)
             if cached is not None:
-                self._log('cache hit IMDb: {!r}'.format(query))
                 return list(cached)
-        result = self._search_imdb_uncached(query, kinds)
-        if cache_key and result is not None:
+        result, error = self._search_imdb_uncached(query, kinds)
+        if cache_key and result is not None and error is None:
             self._imdb_cache.set(cache_key, list(result))
         return result
 
@@ -625,25 +946,26 @@ class torrentio(object):
             for kind in ('movie', 'series'):
                 if kind in kinds:
                     items.append(self._make_item(imdb_id, imdb_id, '', kind == 'series', kind, link))
-            return items
+            return items, None
 
         if not self._imdb_cb.allow_request():
-            self._log('circuit breaker IMDb aperto: salto la ricerca')
-            return []
+            return [], 'circuit_open'
 
         slug = self._normalize_slug(query)
         if not slug:
-            return []
+            return [], None
         imdb_url = 'https://v3.sg.media-imdb.com/suggestion/{}/{}.json'.format(slug[0], slug)
         data, error = self._http_json(imdb_url, timeout=8, retries=1)
 
         if error in ('server', 'timeout', 'network', 'ratelimit'):
             self._imdb_cb.record_failure()
-        elif error is None:
-            self._imdb_cb.record_success()
+            return [], error
+        if error is not None:
+            return [], error
+        self._imdb_cb.record_success()
 
         if not isinstance(data, dict):
-            return []
+            return [], 'invalid_response'
 
         items = []
         for entry in data.get('d', []):
@@ -663,7 +985,7 @@ class torrentio(object):
                 imdb_id, entry.get('l', 'Sconosciuto'), entry.get('y', ''),
                 kind == 'series', kind, 'https://www.imdb.com/title/{}/'.format(imdb_id)
             ))
-        return items
+        return items, None
 
     def _search_kitsu(self, query, kinds):
         params = urllib.parse.urlencode({'filter[text]': query, 'page[limit]': 5})
@@ -734,35 +1056,50 @@ class torrentio(object):
 
     def _make_request(self, item, season, episode):
         if not item['is_series']:
-            return {
+            return [{
                 'item': item,
                 'path': '{}/{}'.format(item['path_type'], item['id']),
                 'label': '',
                 'season_only': False
-            }
+            }]
+
         if item['id'].startswith('kitsu:'):
             ep = episode if episode is not None else 1
-            return {
+            return [{
                 'item': item,
                 'path': '{}/{}:{}'.format(item['path_type'], item['id'], ep),
                 'label': ' E{:02d}'.format(ep),
                 'season_only': False
-            }
-        eff_season = season if season is not None else 1
-        eff_episode = episode if episode is not None else 1
-        season_only = season is not None and episode is None
-        if season is None:
-            label = ' S{:02d}E{:02d}'.format(eff_season, eff_episode)
-        elif season_only:
-            label = ' S{:02d}'.format(season)
-        else:
-            label = ' S{:02d}E{:02d}'.format(season, episode)
-        return {
-            'item': item,
-            'path': '{}/{}:{}:{}'.format(item['path_type'], item['id'], eff_season, eff_episode),
-            'label': label,
-            'season_only': season_only
-        }
+            }]
+
+        if season is not None:
+            eff_episode = episode if episode is not None else 1
+            season_only = episode is None
+            label = ' S{:02d}'.format(season) if season_only else ' S{:02d}E{:02d}'.format(season, eff_episode)
+            return [{
+                'item': item,
+                'path': '{}/{}:{}:{}'.format(item['path_type'], item['id'], season, eff_episode),
+                'label': label,
+                'season_only': season_only
+            }]
+
+        if not self.SEARCH_ALL_SEASONS:
+            return [{
+                'item': item,
+                'path': '{}/{}:1:1'.format(item['path_type'], item['id']),
+                'label': ' S01E01',
+                'season_only': False
+            }]
+
+        requests = []
+        for s in range(1, self.MAX_SEASONS + 1):
+            requests.append({
+                'item': item,
+                'path': '{}/{}:{}:1'.format(item['path_type'], item['id'], s),
+                'label': ' S{:02d}'.format(s),
+                'season_only': True
+            })
+        return requests
 
     def _get_torrentio_client(self):
         return _TorrentioClient(
@@ -782,7 +1119,6 @@ class torrentio(object):
         if self.CACHE_ENABLED and self._stream_cache is not None:
             cached = self._stream_cache.get(path)
             if cached is not None:
-                self._log('cache hit stream: {}'.format(path))
                 return req, list(cached)
 
         client = self._get_torrentio_client()
@@ -795,16 +1131,25 @@ class torrentio(object):
                 self._stream_cache.set(path, list(streams))
         elif error == 'ratelimit' and self._rate_limiter is not None and self.RATE_LIMIT_ADAPTIVE:
             self._rate_limiter.escalate()
-            self._log('rate limit: aumento intervallo a {:.2f}s'.format(self._rate_limiter.current))
 
         return req, streams
 
     def _build_magnet(self, stream, display_name):
-        if stream.get('magnet'):
-            return stream['magnet']
-        info_hash = stream.get('infoHash')
-        if not info_hash:
+        existing = stream.get('magnet')
+        if existing:
+            validated = _validate_magnet(existing)
+            if validated:
+                return validated
+            self._log('magnet scartato (schema o hash non validi)')
             return None
+
+        info_hash = stream.get('infoHash')
+        validated_hash = _validate_info_hash(info_hash)
+        if not validated_hash:
+            if info_hash:
+                self._log('infoHash scartato: {!r}'.format(info_hash))
+            return None
+
         trackers = []
         for src in stream.get('sources') or []:
             if isinstance(src, str) and src.startswith('tracker:'):
@@ -814,9 +1159,10 @@ class torrentio(object):
         for fb in self.FALLBACK_TRACKERS:
             if fb not in trackers:
                 trackers.append(fb)
+
         encoded_name = urllib.parse.quote(display_name)
         tr_params = ''.join('&tr={}'.format(urllib.parse.quote(tr)) for tr in trackers[:15])
-        return 'magnet:?xt=urn:btih:{}&dn={}{}'.format(info_hash, encoded_name, tr_params)
+        return 'magnet:?xt=urn:btih:{}&dn={}{}'.format(validated_hash, encoded_name, tr_params)
 
     def _parse_size(self, text):
         match = self.RE_SIZE.search(text)
@@ -831,65 +1177,134 @@ class torrentio(object):
         match = self.RE_SEEDS.search(text)
         return match.group(1) if match else '0'
 
+    def _has_premium_audio(self, text):
+        return bool(self.RE_PREMIUM_AUDIO.search(text or ''))
+
     def _detect_language(self, raw_title):
         no_sub = self.RE_SUB_ITA.sub(' ', raw_title)
-        is_ita = bool(self.RE_AUDIO_ITA.search(no_sub))
-        if self.USE_ITA_FLAG and self.FLAG_IT in raw_title:
-            is_ita = True
+        has_ita_token = bool(self.RE_AUDIO_ITA.search(no_sub))
+        has_flag = self.USE_ITA_FLAG and self.FLAG_IT in raw_title
+        is_ita = has_ita_token or has_flag
+
+        if not is_ita and self.TRUST_LANGUAGE_FILTER:
+            if not self.RE_NON_ITA_LANG.search(raw_title):
+                is_ita = True
+
         is_sub = (not is_ita) and bool(self.RE_SUB_ITA.search(raw_title))
-        return is_ita, is_sub
+        is_multi = is_ita and self._has_premium_audio(raw_title)
+        return is_ita, is_multi, is_sub
 
     def _extract_codec(self, text):
-        tags = []
         m = self.RE_CODEC.search(text)
+        if not m:
+            return ''
+        codec = m.group(1).upper().replace(' ', '').replace('.', '').replace('_', '').replace('-', '')
+        if codec in ('H265', 'HEVC', 'X265'):
+            return 'H265'
+        if codec in ('H264', 'X264'):
+            return 'H264'
+        if codec == 'AV1':
+            return 'AV1'
+        return ''
+
+    def _extract_audio_info(self, text):
+        if not text:
+            return ''
+        lower = text.lower()
+        codec = ''
+        if re.search(r'\bdts[\s._-]?hd[\s._-]?ma\b', lower):
+            codec = 'DTS-HD MA'
+        elif re.search(r'\bdts[\s._-]?hd\b', lower):
+            codec = 'DTS-HD'
+        elif re.search(r'\bdts[\s._-]?x\b', lower):
+            codec = 'DTS-X'
+        elif re.search(r'\bdts[\s._-]?es\b', lower):
+            codec = 'DTS-ES'
+        elif re.search(r'\bdts\b', lower):
+            codec = 'DTS'
+        elif re.search(r'\btruehd\b', lower):
+            codec = 'TrueHD'
+        elif re.search(r'\bddp\b|\bdd\+|\be[\s._-]?ac[\s._-]?3\b', lower):
+            codec = 'DDP'
+        elif re.search(r'\bac[\s._-]?3\b', lower):
+            codec = 'AC3'
+        elif re.search(r'\bdd\b', lower):
+            codec = 'DD'
+        elif re.search(r'\baac\b', lower):
+            codec = 'AAC'
+        elif re.search(r'\bflac\b', lower):
+            codec = 'FLAC'
+        elif re.search(r'\bopus\b', lower):
+            codec = 'OPUS'
+        elif re.search(r'\bmp3\b', lower):
+            codec = 'MP3'
+        channels = ''
+        m = re.search(r'\b([1-8])[\s._-]([0-2])\b', text)
         if m:
-            codec = m.group(1).upper().replace(' ', '').replace('.', '').replace('_', '').replace('-', '')
-            if codec in ('H265', 'HEVC', 'X265'):
-                tags.append('H265')
-            elif codec in ('H264', 'X264'):
-                tags.append('H264')
-            elif codec == 'AV1':
-                tags.append('AV1')
-        m = self.RE_AUDIO_CODEC.search(text)
-        if m:
-            audio = m.group(1).upper().replace(' ', '').replace('.', '').replace('_', '').replace('-', '')
-            if audio.startswith('DDP') or audio.startswith('DD'):
-                tags.append('DD')
-            elif audio.startswith('AC3'):
-                tags.append('AC3')
-            elif audio.startswith('EAC3'):
-                tags.append('EAC3')
-            elif audio.startswith('DTS'):
-                tags.append('DTS')
-            elif audio.startswith('TRUEHD'):
-                tags.append('TRUEHD')
-            elif audio.startswith('ATMOS'):
-                tags.append('ATMOS')
-            elif audio.startswith('AAC'):
-                tags.append('AAC')
-        if self.RE_MULTI.search(text):
-            tags.append('MULTI')
-        return '|'.join(tags)
+            channels = '{}.{}'.format(m.group(1), m.group(2))
+        else:
+            m = re.search(r'\b([1-8])ch\b', lower)
+            if m:
+                ch = m.group(1)
+                channels = {'1': '1.0', '2': '2.0', '6': '5.1', '8': '7.1'}.get(ch, ch + 'ch')
+        has_atmos = bool(re.search(r'\batmos\b', lower))
+        parts = []
+        if codec:
+            parts.append(codec)
+        if channels:
+            parts.append(channels)
+        if has_atmos and codec != 'ATMOS':
+            parts.append('ATMOS')
+        return ' '.join(parts)
+
+    def _extract_resolution(self, quality, first_line, raw_title=''):
+        for text in (quality, first_line, raw_title):
+            if not text:
+                continue
+            m = self.RE_RESOLUTION.search(text)
+            if not m:
+                continue
+            token = m.group(1).lower()
+            if token in ('2160p', '4k', 'uhd'):
+                return '4k'
+            if token in ('1440p', '2k'):
+                return '1440p'
+            return token
+        return 'unknown'
+
+    def _resolution_rank(self, resolution):
+        try:
+            return self.RESOLUTION_PRIORITY.index(resolution)
+        except ValueError:
+            return len(self.RESOLUTION_PRIORITY)
 
     def _extract_metadata(self, stream, req, filters):
         item = req['item']
         raw_title = str(stream.get('title') or '')
         lines = [line.strip() for line in raw_title.split('\n') if line.strip()]
         first_line = lines[0] if lines else 'Release'
-
         name_parts = [p.strip() for p in str(stream.get('name') or '').split('\n') if p.strip()]
         quality = name_parts[-1] if len(name_parts) > 1 else ''
-
         tracker_match = self.RE_TRACKER.search(raw_title)
         tracker = tracker_match.group(1).strip() if tracker_match else 'Torrentio'
 
-        is_ita, is_sub = self._detect_language(raw_title)
+        is_ita, is_multi, is_sub = self._detect_language(raw_title)
         if (self.ONLY_ITA or filters['ita']) and not is_ita:
+            return None
+        if self.ONLY_ITA_AUDIO and is_sub:
             return None
 
         if filters['res']:
             rx = self.RES_TOKENS[filters['res']]
             if not (rx.search(quality) or rx.search(first_line)):
+                return None
+
+        resolution = self._extract_resolution(quality, first_line, raw_title)
+        if item['path_type'] in ('movie', 'series') and self.MIN_RESOLUTION:
+            if resolution == 'unknown':
+                if self.STRICT_RESOLUTION:
+                    return None
+            elif self._resolution_rank(resolution) > self._resolution_rank(self.MIN_RESOLUTION):
                 return None
 
         is_pack = (
@@ -905,24 +1320,42 @@ class torrentio(object):
             quality=quality,
             tracker=tracker,
             is_ita=is_ita,
+            is_multi=is_multi,
             is_sub=is_sub,
             is_pack=is_pack,
             codec=self._extract_codec(first_line),
+            audio=self._extract_audio_info(first_line),
+            resolution=resolution,
             size_bytes=self._parse_size(raw_title),
             seeds=self._parse_seeds(raw_title),
         )
 
     def _format_display_name(self, meta, req):
         item = req['item']
-        lang_tag = '[ITA] ' if meta.is_ita else ('[SUB ITA] ' if meta.is_sub else '')
+        audio_tag = ''
+        if self.SHOW_AUDIO_INFO and meta.audio:
+            audio_tag = '[{}] '.format(meta.audio)
+        if meta.is_multi:
+            lang_tag = '[MULTI] '
+        elif meta.is_ita:
+            lang_tag = '[ITA] '
+        elif meta.is_sub:
+            lang_tag = '[SUB ITA] '
+        else:
+            lang_tag = ''
         qual_tag = '[{}] '.format(meta.quality) if meta.quality and meta.quality.lower() != 'torrentio' else ''
         pack_tag = '[PACK] ' if meta.is_pack else ''
         codec_tag = '[{}] '.format(meta.codec) if meta.codec else ''
         year_str = ' ({})'.format(item['year']) if item['year'] else ''
-        return '{}{}{}{}{}{}{} - {} [{}]'.format(
-            lang_tag, qual_tag, pack_tag, codec_tag,
-            item['title'], req['label'], year_str, meta.first_line, meta.tracker
-        ).replace('|', ' ')
+        name = '{}{}{}{}{}{}{}{}'.format(
+            audio_tag, lang_tag, qual_tag, pack_tag, codec_tag,
+            item['title'], req['label'], year_str
+        )
+        if self.SHOW_RELEASE_SUFFIX and meta.first_line:
+            name = '{} - {}'.format(name, meta.first_line)
+        if self.SHOW_TRACKER_IN_NAME and meta.tracker:
+            name = '{} [{}]'.format(name, meta.tracker)
+        return name.replace('|', ' ').strip()
 
     def _stream_to_result(self, stream, req, filters):
         meta = self._extract_metadata(stream, req, filters)
@@ -931,7 +1364,7 @@ class torrentio(object):
         link = self._build_magnet(stream, meta.first_line.replace('|', ' '))
         if not link:
             return None
-        return {
+        packet = {
             'link': link,
             'name': self._format_display_name(meta, req),
             'size': meta.size_bytes,
@@ -941,16 +1374,30 @@ class torrentio(object):
             'desc_link': req['item']['desc_link'],
             'pub_date': '-1'
         }
+        return packet, meta
 
-    def _dedup_key(self, stream, packet):
-        info_hash = str(stream.get('infoHash') or '').lower()
+    def _hash_key(self, stream):
+        return _validate_info_hash(stream.get('infoHash'))
+
+    def _title_dedup_key(self, packet, meta):
         if not self.SMART_DEDUP:
-            return info_hash or None
-        title_norm = self.RE_DEDUP_STRIP.sub('', packet.get('name', '')).lower()
-        title_norm = re.sub(r'[^a-z0-9]+', '', title_norm)
-        if not info_hash and not title_norm:
             return None
-        return (info_hash, title_norm)
+        name = packet.get('name', '')
+        name = re.sub(r'\s*\[[^\]]+\]\s*$', '', name)
+        name = re.sub(r'\[[^\]]*\]', ' ', name)
+        title_norm = self.RE_DEDUP_STRIP.sub('', name).lower()
+        title_norm = re.sub(r'[^a-z0-9]+', '', title_norm)
+        if not title_norm:
+            return None
+        return (
+            title_norm,
+            meta.resolution,
+            meta.codec,
+            meta.audio,
+            meta.is_ita,
+            meta.is_multi,
+            meta.is_sub,
+        )
 
     @staticmethod
     def _seed_sort_key(packet):
@@ -959,16 +1406,51 @@ class torrentio(object):
         except (TypeError, ValueError):
             return 0
 
+    def _build_sort_key(self, packet, meta):
+        try:
+            seeds = int(packet.get('seeds', '0'))
+        except (TypeError, ValueError):
+            seeds = 0
+        try:
+            size = int(packet.get('size', '-1'))
+        except (TypeError, ValueError):
+            size = -1
+        if size < 0:
+            size = 0
+        if self.SORT_STRATEGY == 'seeds':
+            return (-seeds,)
+        if meta.is_ita:
+            lang_rank = 0
+        elif meta.is_sub:
+            lang_rank = 1
+        else:
+            lang_rank = 2
+        if lang_rank == 0 and self.MIN_SEEDS_FOR_PRIORITY > 0 and seeds < self.MIN_SEEDS_FOR_PRIORITY:
+            lang_rank = 3
+        res_rank = self._resolution_rank(meta.resolution)
+        if self.SORT_STRATEGY == 'ita_then_seeds':
+            return (lang_rank, res_rank, -seeds, -size)
+        return (lang_rank, res_rank, -size, -seeds)
+
     def search(self, what, cat='all'):
         start_time = time.monotonic()
-
         raw_query = urllib.parse.unquote_plus(what).strip()
         if not raw_query:
             return
 
+        try:
+            self._search_impl(raw_query, cat, start_time)
+        finally:
+            if self.PERSIST_STATE:
+                self._auto_save_state()
+
+    def _search_impl(self, raw_query, cat, start_time):
         season, episode, query = self._extract_season_episode(raw_query)
         if not query:
             query = raw_query
+
+        query_before_filters = query
+
         query, filters = self._extract_filters(query)
         year, query_no_year = self._extract_year(query)
 
@@ -981,51 +1463,66 @@ class torrentio(object):
         else:
             kinds = {'movie', 'series'}
 
-        self._log('ricerca: query={!r} anno={} S={} E={} filtri={} cat={}'.format(
-            query_no_year, year, season, episode, filters, cat))
-
         items = self._find_titles(query_no_year, query, cat, kinds, year)
+
+        filters_active = filters['ita'] or filters['pack'] or filters['res']
+        if not items and filters_active and query_before_filters != query:
+            year2, qbf_no_year = self._extract_year(query_before_filters)
+            self._log('retry con query originale (filtri inline): {!r}'.format(qbf_no_year))
+            items = self._find_titles(qbf_no_year, query_before_filters, cat, kinds, year2 or year)
+
         if not items:
             self._log('nessun titolo trovato per {!r}'.format(raw_query))
             return
 
-        requests = [self._make_request(item, season, episode) for item in items]
-        seen_keys = set()
-        packets = []
+        all_requests = []
+        for item in items:
+            all_requests.extend(self._make_request(item, season, episode))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(requests))) as executor:
-            futures = [executor.submit(self._fetch_stream, req) for req in requests]
+        seen_by_hash = set()
+        seen_by_title = {}
+        results = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, len(all_requests))) as executor:
+            futures = [executor.submit(self._fetch_stream, req) for req in all_requests]
 
             for future in concurrent.futures.as_completed(futures):
                 if (time.monotonic() - start_time) > self.GLOBAL_TIMEOUT:
-                    self._log('timeout globale ({:.0f}s) raggiunto: interrompo'.format(self.GLOBAL_TIMEOUT))
                     break
-
                 try:
                     req, streams = future.result()
-                except Exception as exc:
-                    self._log('richiesta fallita: {}'.format(exc))
+                except Exception:
                     continue
-
                 for stream in streams:
                     if not isinstance(stream, dict):
                         continue
                     try:
-                        packet = self._stream_to_result(stream, req, filters)
-                    except Exception as exc:
-                        self._log('stream scartato: {}'.format(exc))
+                        result = self._stream_to_result(stream, req, filters)
+                    except Exception:
                         continue
-                    if not packet:
+                    if not result:
                         continue
-                    key = self._dedup_key(stream, packet)
-                    if key is not None and key in seen_keys:
-                        continue
-                    if key is not None:
-                        seen_keys.add(key)
-                    packets.append(packet)
+                    packet, meta = result
 
-        if self.SORT_BY_SEEDS and packets:
-            packets.sort(key=self._seed_sort_key, reverse=True)
+                    hkey = self._hash_key(stream)
+                    if hkey and hkey in seen_by_hash:
+                        continue
+                    if hkey:
+                        seen_by_hash.add(hkey)
 
-        for packet in packets:
+                    tkey = self._title_dedup_key(packet, meta)
+                    if tkey and tkey in seen_by_title:
+                        idx = seen_by_title[tkey]
+                        old_packet, old_meta = results[idx]
+                        if self._seed_sort_key(packet) > self._seed_sort_key(old_packet):
+                            results[idx] = (packet, meta)
+                        continue
+                    if tkey:
+                        seen_by_title[tkey] = len(results)
+                    results.append((packet, meta))
+
+        if results:
+            results.sort(key=lambda rm: self._build_sort_key(rm[0], rm[1]))
+
+        for packet, _meta in results:
             prettyPrinter(packet)
