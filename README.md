@@ -29,63 +29,72 @@ Questo script Python colma il divario tra l'ecosistema di Stremio e qBittorrent,
 - ⚙️ **Configurazione automatica**: al primo avvio crea `torrentio.json` accanto al plugin. Le modifiche sopravvivono agli aggiornamenti.
 - 💾 **Persistenza stato**: cache, health tracker, circuit breaker e rate limiter sopravvivono tra ricerche diverse.
 
-## 🆕 Cronologia delle novità
+## 🆕 Novità nella v2.70
 
-Questa sezione raccoglie tutte le modifiche dalla v2.70 alla v3.08, organizzate per area tematica. Se hai già installato una versione precedente, non serve reinstallare: qBittorrent aggiornerà il plugin al prossimo controllo.
+Se hai già installato una versione precedente, ecco cosa è cambiato. Non serve reinstallare: qBittorrent aggiornerà il plugin automaticamente al prossimo controllo.
 
-### 🛡️ Resilienza e stabilità
+- 🛡️ **Self-Healing Multi-Istanza**: Il plugin ora usa due istanze Torrentio (`torrentio.strem.fun` e `torrentio.elfhosted.com`). Se una fallisce, passa automaticamente all'altra. Le istanze che rispondono con errori ripetuti vengono messe in "quarantena" per 120 secondi e riprovate a scadenza.
+- 🌐 **Fallback Cloudflare tramite Proxy**: Quando un'istanza risponde con `403` (blocco Cloudflare), il plugin prova in sequenza una lista di proxy CORS pubblici (`allorigins`, `codetabs`, `cors.lol`, `cors.eu.org`, `corsproxy.io` e altri). Primo proxy funzionante vince.
+- ⚡ **Rate Limiting Adattivo**: Le chiamate HTTP sono serializzate con un intervallo configurabile. Su risposta `429` l'intervallo aumenta automaticamente (fino a 5s); su successo si riduce gradualmente. Il plugin "impara" il ritmo accettato dal server.
+- 💾 **Caching Intelligente**: Cache TTL separata per le ricerche IMDb (1 ora) e per i risultati Torrentio (5 minuti). Evita richieste ripetute e riduce latenza e rischio di blocco.
+- ⏱️ **Timeout Globale**: Se una ricerca si trascina troppo (istanze lente + retry + proxy), il plugin interrompe dopo 90 secondi e restituisce quello che ha già raccolto, invece di far aspettare l'utente indefinitamente.
+- 🔧 **Fallback URL Pulito**: Se l'URL con i filtri Torrentio fallisce, il plugin riprova senza filtri sulla stessa istanza prima di passare oltre.
+- 🎯 **Ordinamento per Seeders**: I risultati finali vengono ordinati localmente per numero di seeders, indipendentemente dall'ordine di arrivo dei worker.
+- 🧪 **Error Typing Strutturato**: Ogni errore HTTP viene classificato (`blocked`, `ratelimit`, `server`, `timeout`, `network`, `invalid_json`) e ha una strategia di recovery dedicata.
+- 🧽 **Provider Ripuliti**: Rimossi `rarbg` (defunto) e `horriblesubs` (non più attivo). Aggiunto filtro qualità esteso che esclude anche `480p`, `other` e `unknown`.
+- 📝 **Logging Opzionale su File**: Attivabile con `DEBUG = True`, scrive su `/tmp/torrentio_ultra.log` senza inquinare l'output di qBittorrent.
+- 🎭 **User-Agent Rotanti**: Cinque stringhe reali (Chrome, Firefox, Safari, Linux, macOS) per ridurre il fingerprinting.
 
-Evoluzione del modo in cui il plugin gestisce errori di rete, istanze irraggiungibili e servizi lenti.
+## 🆕 Novità nella v3.00
 
-- **Self-healing multi-istanza** (v2.70): due istanze Torrentio (`torrentio.strem.fun` e `torrentio.elfhosted.com`). Se una fallisce, si passa automaticamente all'altra. Le istanze con errori ripetuti vanno in quarantena e vengono riprovate a scadenza.
-- **Fallback Cloudflare tramite proxy** (v2.70): su `403` il plugin prova in sequenza una lista di proxy CORS pubblici. Primo che risponde vince.
-- **Rate limiting adattivo** (v2.70): le chiamate HTTP sono serializzate. Su `429` l'intervallo aumenta (fino a 5s); su successo si riduce gradualmente.
-- **Timeout globale** (v2.70): se una ricerca si trascina oltre i 90 secondi, il plugin interrompe e restituisce quello che ha già raccolto.
-- **Error typing strutturato** (v2.70): ogni errore HTTP viene classificato (`blocked`, `ratelimit`, `server`, `timeout`, `network`, `invalid_json`) con una strategia di recovery dedicata.
-- **Circuit breaker su IMDb** (v3.00): dopo 5 fallimenti consecutivi il circuito si apre per 60 secondi. Le ricerche successive tornano vuote istantaneamente invece di attendere timeout+retry in cascata.
-- **Client Torrentio separato** (v3.00): la logica di rete vive in `_TorrentioClient`, isolata dall'orchestratore.
-- **Retry fallback più stretto** (v3.06): il fallback all'URL Torrentio senza filtri parte solo per errori 4xx e JSON non valido, non più per timeout o errori di rete. Una singola istanza morta non costa più ~60 secondi prima di passare alla successiva.
-- **Circuit breaker HALF_OPEN corretto** (v3.06): in stato di recupero lascia passare una sola richiesta di prova, non tutte.
-- **Check versione Python all'avvio** (v3.00, corretto in v3.06): se il plugin viene caricato su Python < 3.8, solleva un errore chiaro prima di qualsiasi import che richieda 3.7+.
+Aggiornamento di solidificazione: nessuna nuova funzionalità visibile, ma il plugin diventa **testabile, diagnosticabile e resiliente a livello industriale**. Il motore è lo stesso della v2.70; cambia ciò che sta sotto il cofano.
 
-### 🎯 Qualità e leggibilità dei risultati
+- 🔌 **Circuit Breaker su IMDb**: se l'endpoint IMDb fallisce 5 volte consecutive (server down, timeout, network), il plugin apre il circuito per 60 secondi. Le ricerche successive tornano vuote **istantaneamente**, senza far attendere l'utente per timeout+retry in cascata. Dopo i 60 secondi, una richiesta di prova verifica se il servizio è tornato disponibile.
+- 🧱 **Client Torrentio separato**: la logica di rete (istanze multiple, proxy, fallback) è stata estratta in una classe dedicata `_TorrentioClient`. Comportamento identico alla v2.70, ma il codice è ora testabile in isolamento.
+- 📦 **ParsedStream tipizzato**: i metadati estratti da uno stream non sono più un dizionario con chiavi arbitrarie, ma una dataclass con campi espliciti. Se in futuro aggiungi una metrica (es. HDR), il type checker ti segnala tutti i punti da aggiornare.
+- 📚 **Documentazione architetturale**: nuovo file `ARCHITECTURE.md` che spiega pipeline di ricerca, ruolo di ogni classe, strategie di resilienza e motivazioni delle scelte di design.
+- 🐍 **Check versione Python**: se il plugin viene caricato su Python < 3.8, solleva un errore chiaro all'avvio invece di fallire in modo oscuro.
+- 🐛 **Bug fix minori**: `_RateLimiter` espone `current` come property thread-safe; il circuit breaker IMDb riceve correttamente `record_success`/`record_failure` in base all'esito delle chiamate.
 
-Come cambia quello che vedi nella lista dei risultati.
+## 🆕 Novità nella v3.08
 
-- **Nome pulito con audio in testa** (v3.02): il tag audio (codec + canali + Atmos) è il primo elemento del nome. Niente più suffisso del release (`The.Lord.of.the.Rings.2001.2160p...`) né nome del tracker, salvo configurazione esplicita.
-- **Tag `[MULTI]`** (v3.02): quando un release contiene audio italiano **e** un codec premium (TrueHD / DTS-HD MA / Atmos), viene taggato `[MULTI]` invece di `[ITA]`. I release ITA con codec normali restano `[ITA]`.
-- **Ordinamento a fasce** (v3.02, raffinato in v3.03): lingua → risoluzione → dimensione → seeders. Nessun ITA viene declassato per pochi seeders (`MIN_SEEDS_FOR_PRIORITY = 0` di default dalla v3.03).
-- **2K/1440p visibili** (v3.03): rimosso `unknown` da `QUALITY_FILTER`. Torrentio classificava i 1440p come `unknown` e li scartava a monte.
-- **Rilevamento risoluzione più affidabile** (v3.03): la risoluzione viene cercata in `quality`, `first_line` e nell'intero `raw_title`.
-- **Filtro risoluzione minima** (v3.02): per film e serie i risultati sotto 1080p vengono scartati. Per gli anime il filtro non si applica.
-- **Deduplica corretta** (v3.06, fix urgente in v3.07): prima dedup per `infoHash` sempre, poi dedup per titolo includendo risoluzione, codec video, codec audio e lingua. A parità di chiave vince la release con più seeders. `Dune 4K ITA` e `Dune 1080p ITA` restano entrambi.
-- **Retry query originale** (v3.06): se i filtri inline (`ita`, `pack`, `4k`, ecc.) svuotano la query e non si trova nulla, il plugin riprova con la query originale. `The Italian Job` non diventa più `The Job` senza recupero.
-- **Ricerca serie multi-stagione** (v3.05): `SEARCH_ALL_SEASONS` opzionale per cercare tutte le stagioni 1..`MAX_SEASONS` quando non ne specifichi una.
-- **`ONLY_ITA_AUDIO`** (v3.05): esclude i risultati con solo sottotitoli italiani, tenendo solo audio ITA o `[MULTI]`.
-- **`MAX_TITLES`** portato da 4 a 8 (v3.05): più candidati da IMDb, più probabilità di trovare la serie giusta con titoli localizzati.
-- **Tagging ITA più affidabile** (v3.02): il plugin si fida del filtro `language=italian` lato Torrentio. I risultati sono taggati `[ITA]`/`[MULTI]` anche senza token esplicito nel nome, a meno che non dichiarino un'altra lingua.
+Aggiornamento che porta il plugin da "motore solido" a "motore solido, sicuro, configurabile e persistente". Il cuore della ricerca è lo stesso della v3.00, ma cambia molto di ciò che l'utente vede e di come il plugin si comporta tra una ricerca e l'altra.
+
+### 🎯 Nome del risultato e ordinamento
+
+- 🎧 **Audio in testa al nome**: il tag audio (codec + canali + Atmos) è ora il primo elemento visibile. Vedi subito `[DDP 5.1]`, `[AAC 2.0]`, `[DTS-HD MA 7.1]`, `[TrueHD 7.1 ATMOS]`.
+- 🏷️ **Nuovo tag `[MULTI]`**: quando un release contiene audio italiano **e** un codec premium (TrueHD / DTS-HD MA / Atmos), viene taggato `[MULTI]` invece di `[ITA]`. Significa "c'è l'italiano, ma la traccia principale è probabilmente l'originale in alta qualità". I release ITA con codec normali restano `[ITA]`.
+- 🧹 **Nome pulito**: il nome visualizzato non include più il suffisso del release (`The.Lord.of.the.Rings.2001.2160p...`) né il nome del tracker. Quello che vedi è solo: `[audio] [lingua] [risoluzione] [codec] Titolo (anno)`. Configurabile con `SHOW_RELEASE_SUFFIX` e `SHOW_TRACKER_IN_NAME`.
+- 🗂️ **Ordinamento a fasce**: lingua (ITA → SUB ITA → altre) → risoluzione (4K → 1440p → 1080p) → dimensione decrescente → seeders. Nessun ITA viene declassato per pochi seeders.
+- 🎚️ **Filtro risoluzione minima**: per film e serie, i risultati sotto `1080p` vengono scartati. Per gli anime il filtro non si applica. Configurabile con `MIN_RESOLUTION`.
+- 🔍 **2K/1440p visibili**: rimosso `unknown` da `QUALITY_FILTER`. Torrentio classificava i 2K come `unknown` e li scartava a monte. Ora passano e vengono ordinati correttamente.
+
+### 🧹 Deduplica e qualità dei risultati
+
+- 🧹 **Deduplica corretta**: prima dedup per `infoHash` sempre, poi dedup per titolo normalizzato **includendo risoluzione, codec video, codec audio e lingua**. Due release sono considerate duplicate solo se hanno lo stesso "cuore tecnico". A parità di chiave vince la release con più seeders. `Dune 4K ITA` e `Dune 1080p ITA` restano entrambi; `Dune 1080p H265 AAC ITA` da due tracker diversi viene deduplicato.
+- 🔁 **Retry query originale**: se i filtri inline (`ita`, `pack`, `4k`, ecc.) svuotano la query e non si trova nulla, il plugin riprova automaticamente con la query originale. `The Italian Job` non diventa più `The Job` senza recupero.
+- 🤝 **Tagging ITA più affidabile**: il plugin si fida del filtro `language=italian` lato Torrentio. I risultati sono taggati `[ITA]`/`[MULTI]` anche senza token esplicito nel nome, a meno che non dichiarino un'altra lingua (`[ENG]`, `[FR]`, ecc.). Configurabile con `TRUST_LANGUAGE_FILTER`.
+- 🎬 **Ricerca serie multi-stagione**: nuova opzione `SEARCH_ALL_SEASONS` per cercare tutte le stagioni 1..`MAX_SEASONS` quando non ne specifichi una. Prima si fermava a `S01E01`.
+- 🔇 **`ONLY_ITA_AUDIO`**: nuova opzione per escludere i risultati con solo sottotitoli italiani, tenendo solo quelli con audio ITA o `[MULTI]`.
+- 📈 **`MAX_TITLES`** portato da 4 a 8: più candidati da IMDb, più probabilità di trovare la serie giusta con titoli localizzati.
 
 ### 🔒 Sicurezza
 
-- **Validazione magnet** (v3.06): accettati solo magnet con schema `magnet:?xt=urn:btih:` e infoHash di 40 caratteri esadecimali (o 32 base32). Hash malformati scartati e loggati con `DEBUG = True`.
-- **Cache IMDb onesta** (v3.06): le liste vuote dovute a errori di rete non vengono più cachate per un'ora. Solo le risposte senza errore entrano in cache.
+- 🛡️ **Validazione magnet**: accettati solo magnet con schema `magnet:?xt=urn:btih:` e infoHash di 40 caratteri esadecimali (o 32 base32). Hash malformati scartati e loggati con `DEBUG = True`.
+- 🔁 **Retry fallback più stretto**: il fallback all'URL Torrentio senza filtri parte solo per errori 4xx e JSON non valido, non più per timeout, network o 5xx. Una singola istanza morta non costa più ~60 secondi prima di passare alla successiva.
+- 💾 **Cache IMDb onesta**: le liste vuote dovute a errori di rete (timeout, network, 5xx, `circuit_open`) non vengono più cachate per un'ora. Solo le risposte senza errore entrano in cache.
+- 🔌 **Circuit breaker HALF_OPEN corretto**: in stato di recupero lascia passare una sola richiesta di prova, non tutte.
+- 🐍 **Check versione Python spostato prima degli import**: su Python <3.8 si vede il messaggio chiaro invece di un `ImportError`.
 
 ### ⚙️ Configurazione e persistenza
 
-- **`torrentio.json`** (v3.08): al primo avvio il plugin crea un file di configurazione accanto a sé stesso con tutti i default. Le modifiche a quel file sopravvivono agli aggiornamenti del plugin.
-- **Persistenza stato** (v3.08): cache, health tracker, circuit breaker e rate limiter vengono salvati in `torrentio_state.json` (cartella temporanea) e ricaricati a ogni ricerca. Scrittura atomica, JSON malformato ignorato, fallback silenzioso se il disco non è scrivibile.
-
-### 🧽 Pulizia e manutenzione
-
-- **Provider ripuliti** (v2.70): rimossi `rarbg` (defunto) e `horriblesubs` (non più attivo).
-- **Logging opzionale su file** (v2.70): con `DEBUG = True` scrive su `/tmp/torrentio_ultra.log` (o `%TEMP%` su Windows) senza inquinare l'output di qBittorrent.
-- **User-Agent rotanti** (v2.70): cinque stringhe reali (Chrome, Firefox, Safari, Linux, macOS).
-- **`ParsedStream` tipizzato** (v3.00): i metadati sono una dataclass esplicita, non un dizionario con chiavi arbitrarie.
-- **Rimozione di codice morto** (v3.06): `field` importato e mai usato rimosso.
+- ⚙️ **`torrentio.json`**: al primo avvio il plugin crea un file di configurazione accanto a sé stesso con tutti i default. Le modifiche a quel file **sopravvivono agli aggiornamenti del plugin**: quando aggiorni da Web Link, il `.py` viene sostituito ma il `.json` resta intatto.
+- 💾 **Persistenza stato**: cache IMDb, cache stream, health tracker istanze, circuit breaker IMDb e intervallo appreso dal rate limiter vengono salvati in `torrentio_state.json` (cartella temporanea) e ricaricati a ogni ricerca. Prima si azzeravano a ogni processo Python (una ricerca = un processo in qBittorrent), rendendo di fatto inutili cache e circuit breaker tra ricerche diverse.
+- 🔒 **Scrittura atomica**: il file di stato viene scritto su file temporaneo e poi rinominato con `os.replace`. Un crash a metà scrittura non corrompe il file. JSON malformato ignorato, permessi mancanti gestiti con fallback silenzioso.
 
 ## 📋 Configurazione
 
-Tutte le costanti principali sono modificabili. Dalla v3.08 il modo consigliato è **il file `torrentio.json`** che il plugin crea accanto a sé: le modifiche lì sopravvivono agli aggiornamenti, mentre quelle nel `.py` vengono sovrascritte.
+Tutte le costanti principali sono modificabili. Il modo consigliato è **il file `torrentio.json`** che il plugin crea accanto a sé: le modifiche lì sopravvivono agli aggiornamenti, mentre quelle nel `.py` vengono sovrascritte.
 
 | Costante | Default | Descrizione |
 |---|---|---|
@@ -135,7 +144,7 @@ Esempio:
 }
 Le chiavi sconosciute vengono ignorate. Se il file è malformato, il plugin lo ignora e continua con i default (log con DEBUG = True). Per disattivare la configurazione esterna, imposta CONFIG_ENABLED = False nel .py.
 
-Come verificare che il JSON venga letto: modifica una costante con effetto visibile immediato (es. "SHOW_TRACKER_IN_NAME": true), salva, fai una nuova ricerca. Se i nomi finiscono con [1337x], [Il Corsaro Nero], ecc., il JSON è stato applicato. Se non cambia nulla, il file non viene letto: controlla che il nome sia esattamente torrentio.json (non .json.txt), che la sintassi sia valida, e che il file sia nella stessa cartella del .py che qBittorrent sta eseguendo.
+Come verificare che il JSON venga letto: modifica una costante con effetto visibile immediato (es. "SHOW_TRACKER_IN_NAME": true), salva, fai una nuova ricerca. Se i nomi finiscono con [1337x], [Il Corsaro Nero], ecc., il JSON è stato applicato. Se non cambia nulla, controlla che il nome sia esattamente torrentio.json (non .json.txt), che la sintassi sia valida, e che il file sia nella stessa cartella del .py che qBittorrent sta eseguendo.
 
 💾 Persistenza dello stato
 Il plugin salva lo stato in torrentio_state.json nella cartella temporanea del sistema (/tmp su Linux, %TEMP% su Windows). Contiene:
