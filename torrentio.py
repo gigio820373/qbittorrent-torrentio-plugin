@@ -5,7 +5,6 @@
 #              + CONFIGURAZIONE AUTOMATICA (torrentio.json accanto al plugin)
 #              + PERSISTENZA STATO (torrentio_state.json in tempdir)
 #              + scrittura atomica, gestione JSON malformato, whitelist chiavi.
-#              Tutte le funzionalità della v3.07 restano invariate.
 
 import sys
 
