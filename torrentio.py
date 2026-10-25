@@ -481,7 +481,7 @@ class torrentio(object):
 
     DEBUG = False
     ONLY_ITA = False
-    ONLY_ITA_AUDIO = False
+    ONLY_ITA_AUDIO = True
     USE_ITA_FLAG = True
     
     # FIX v3.09: Ora è False di default per non fidarsi ciecamente di Torrentio
