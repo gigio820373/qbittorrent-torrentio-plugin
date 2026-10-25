@@ -1,10 +1,10 @@
-# VERSION: 3.08
+# VERSION: 3.09
 # AUTHORS: gigio820373
 # LICENSING INFORMATION: GPL v3
-# DESCRIZIONE: Torrentio Ultra ITA — v3.08
-#              + CONFIGURAZIONE AUTOMATICA (torrentio.json accanto al plugin)
-#              + PERSISTENZA STATO (torrentio_state.json in tempdir)
-#              + scrittura atomica, gestione JSON malformato, whitelist chiavi.
+# DESCRIZIONE: Torrentio Ultra ITA — v3.09
+#              FIX: risolto bug che taggava falsi [ITA] (es. file con solo SUB.ITA).
+#              TRUST_LANGUAGE_FILTER ora è False di default.
+#              + CONFIGURAZIONE AUTOMATICA + PERSISTENZA STATO (v3.08).
 
 import sys
 
@@ -68,8 +68,6 @@ def _validate_magnet(magnet):
 # Configurazione persistente — torrentio.json accanto al plugin
 # ----------------------------------------------------------------------
 
-# Whitelist delle costanti che possono essere sovrascritte da torrentio.json.
-# Nomi di costanti NON in questa lista vengono ignorati.
 CONFIGURABLE_KEYS = {
     'DEBUG', 'ONLY_ITA', 'ONLY_ITA_AUDIO', 'USE_ITA_FLAG', 'TRUST_LANGUAGE_FILTER',
     'PROVIDERS', 'QUALITY_FILTER', 'TORRENTIO_SORT', 'LIMIT',
@@ -103,7 +101,6 @@ def _state_dir():
 
 
 def _atomic_write_json(path, data):
-    """Scrive JSON in modo atomico: tmp + os.replace. Restituisce True se ok."""
     try:
         d = os.path.dirname(path) or '.'
         if not os.path.isdir(d):
@@ -170,7 +167,7 @@ class _TTLCache(object):
     def __init__(self, ttl):
         self.ttl = ttl
         self._lock = threading.Lock()
-        self._store = {}  # key -> (value, expires_at)
+        self._store = {}
 
     def get(self, key):
         with self._lock:
@@ -486,7 +483,9 @@ class torrentio(object):
     ONLY_ITA = False
     ONLY_ITA_AUDIO = False
     USE_ITA_FLAG = True
-    TRUST_LANGUAGE_FILTER = True
+    
+    # FIX v3.09: Ora è False di default per non fidarsi ciecamente di Torrentio
+    TRUST_LANGUAGE_FILTER = False
 
     TORRENTIO_INSTANCES = [
         'https://torrentio.strem.fun',
@@ -639,23 +638,16 @@ class torrentio(object):
         if not self.TORRENTIO_INSTANCES:
             raise ValueError('TORRENTIO_INSTANCES non puo\' essere vuota')
 
-        # --- Config automatica ---
         if self.CONFIG_ENABLED:
             self._auto_load_config()
 
-        # --- Init componenti ---
         self._health_tracker = self._get_or_create_health() if self.SELF_HEALING_ENABLED else None
         self._rate_limiter = self._get_or_create_rate_limiter() if self.RATE_LIMIT_ENABLED else None
         self._imdb_cb = self._get_or_create_imdb_circuit_breaker()
         self._init_caches()
 
-        # --- Carica stato persistito ---
         if self.PERSIST_STATE:
             self._auto_load_state()
-
-    # ------------------------------------------------------------------
-    # Config automatica
-    # ------------------------------------------------------------------
 
     def _config_path(self):
         return os.path.join(_plugin_dir(), self.CONFIG_FILENAME)
@@ -686,7 +678,6 @@ class torrentio(object):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception:
-            # JSON malformato: ignora, non toccare il file
             return
         if not isinstance(data, dict):
             return
@@ -699,10 +690,6 @@ class torrentio(object):
                 setattr(type(self), key, value)
             except Exception:
                 pass
-
-    # ------------------------------------------------------------------
-    # Persistenza stato
-    # ------------------------------------------------------------------
 
     def _state_path(self):
         return os.path.join(_state_dir(), self.STATE_FILENAME)
@@ -752,10 +739,6 @@ class torrentio(object):
             _atomic_write_json(self._state_path(), data)
         except Exception:
             pass
-
-    # ------------------------------------------------------------------
-    # Inizializzazione lazy stati condivisi
-    # ------------------------------------------------------------------
 
     @classmethod
     def _get_or_create_health(cls):
@@ -1180,17 +1163,26 @@ class torrentio(object):
         return bool(self.RE_PREMIUM_AUDIO.search(text or ''))
 
     def _detect_language(self, raw_title):
+        # 1. Controlla se c'è l'audio ITA (rimuovendo prima i tag dei sottotitoli)
         no_sub = self.RE_SUB_ITA.sub(' ', raw_title)
-        has_ita_token = bool(self.RE_AUDIO_ITA.search(no_sub))
+        has_ita_audio = bool(self.RE_AUDIO_ITA.search(no_sub))
         has_flag = self.USE_ITA_FLAG and self.FLAG_IT in raw_title
-        is_ita = has_ita_token or has_flag
+        is_ita = has_ita_audio or has_flag
 
-        if not is_ita and self.TRUST_LANGUAGE_FILTER:
+        # 2. Controlla se ci sono ESPLICITAMENTE i sottotitoli ITA
+        has_sub_ita = bool(self.RE_SUB_ITA.search(raw_title))
+        
+        # is_sub è True SOLO se ci sono i sub ITA e NON c'è l'audio ITA
+        is_sub = has_sub_ita and not is_ita
+
+        # 3. TRUST_LANGUAGE_FILTER scatta SOLO se non ci sono indicatori di lingua
+        # (cioè se il nome non dice né ITA, né SUB ITA, né ENG, ecc.)
+        if not is_ita and not is_sub and self.TRUST_LANGUAGE_FILTER:
             if not self.RE_NON_ITA_LANG.search(raw_title):
                 is_ita = True
 
-        is_sub = (not is_ita) and bool(self.RE_SUB_ITA.search(raw_title))
         is_multi = is_ita and self._has_premium_audio(raw_title)
+        
         return is_ita, is_multi, is_sub
 
     def _extract_codec(self, text):
